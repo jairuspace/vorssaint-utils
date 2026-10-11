@@ -143,6 +143,7 @@ enum DisplayRestorationTests {
         var knownDisplayFingerprints: [UInt32: String] = [:]
         var displayControlFailure: BrightnessService.DisplayControlFailure?
         var pendingDisplayIDs = Set<UInt32>()
+        func forgetWriteOnlyRechecks() {}
         var displays: [BrightnessDisplay] = []
         var refreshes = 0
         var running = false
