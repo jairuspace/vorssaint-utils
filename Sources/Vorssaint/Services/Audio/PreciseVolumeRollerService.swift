@@ -166,8 +166,16 @@ final class PreciseVolumeRollerService: ObservableObject {
         guard BrightnessService.shared.claimsMonitorVolumeKey(press.action) else { return false }
         monitorVolumeKeysHeld.insert(press.action)
         let action = press.action
+        // The precise volume setting applies to the monitor as it does to any
+        // other output: wheel bursts are thinned by the same gate and each
+        // accepted click takes the fine step.
+        let precise = UserDefaults.standard.bool(forKey: DefaultsKey.preciseVolumeRollerEnabled)
+        if precise, case let .step(direction) = action,
+           !gate.accepts(direction > 0 ? .up : .down, at: ProcessInfo.processInfo.systemUptime) {
+            return true
+        }
         DispatchQueue.main.async {
-            Self.applyMonitorVolumeKey(action, fine: fine)
+            Self.applyMonitorVolumeKey(action, fine: fine || precise)
         }
         return true
     }
