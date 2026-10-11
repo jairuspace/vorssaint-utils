@@ -127,6 +127,23 @@ enum DisplaySpeakerVolumeTests {
                      && BrightnessSupport.shouldProbe(pathKey: "b", rememberedPaths: ["a"])
                      && BrightnessSupport.shouldProbe(pathKey: nil, rememberedPaths: ["a"]),
                      "a remembered silent path is not probed again, and an unknown path always is")
+        suite.expect(BrightnessSupport.shouldProbeLuminance(pathKey: "a", writeOnlyPaths: ["a"],
+                        probesAudio: true, recheckedPaths: [])
+                     && !BrightnessSupport.shouldProbeLuminance(pathKey: "a", writeOnlyPaths: ["a"],
+                        probesAudio: true, recheckedPaths: ["a"])
+                     && !BrightnessSupport.shouldProbeLuminance(pathKey: "a", writeOnlyPaths: ["a"],
+                        probesAudio: false, recheckedPaths: [])
+                     && BrightnessSupport.shouldProbeLuminance(pathKey: "b", writeOnlyPaths: ["a"],
+                        probesAudio: false, recheckedPaths: [])
+                     && BrightnessSupport.shouldProbeLuminance(pathKey: nil, writeOnlyPaths: ["a"],
+                        probesAudio: false, recheckedPaths: []),
+                     "a remembered write-only path is read again once while speakers are wanted, then trusted")
+        suite.expect(BrightnessSupport.needsAudioScan(wanted: true, scanned: false, queued: nil)
+                     && !BrightnessSupport.needsAudioScan(wanted: true, scanned: false, queued: true)
+                     && !BrightnessSupport.needsAudioScan(wanted: true, scanned: true, queued: nil)
+                     && BrightnessSupport.needsAudioScan(wanted: false, scanned: true, queued: true)
+                     && !BrightnessSupport.needsAudioScan(wanted: false, scanned: true, queued: false),
+                     "a speaker scan is forced once per setting change, not again while one is queued")
 
         suite.expect(Defaults.registeredDefaults[DefaultsKey.displayVolumeEnabled] as? Bool == false
                      && Defaults.registeredDefaults[DefaultsKey.displayVolumeKeysEnabled] as? Bool == false,
