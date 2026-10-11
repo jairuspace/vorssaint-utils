@@ -2526,6 +2526,17 @@ enum FeatureCatalogTests {
         staleReply.append(staleReply.reduce(UInt8(0x50)) { $0 ^ $1 })
         suite.expect(BrightnessSupport.parseReply(staleReply, code: 0x10) == nil,
                "a reply for another control reads as no reply instead of that control's value")
+        var staleMute: [UInt8] = [0x6E, 0x88, 0x02, 0x00, 0x8D, 0x00, 0x00, 0x02, 0x00, 0x02]
+        staleMute.append(staleMute.reduce(UInt8(0x50)) { $0 ^ $1 })
+        suite.expect(BrightnessSupport.parseReply(staleMute, code: 0x62) == nil,
+               "a valid reply to an earlier mute request reads as no reply to a volume request")
+        suite.expect(BrightnessSupport.parseReply(staleMute, code: 0x8D)?.current == 2,
+               "the same reply reads normally when mute was the control asked")
+        var wrongOpcode = ddcReply
+        wrongOpcode[2] = 0x03
+        wrongOpcode[10] = wrongOpcode[0..<10].reduce(UInt8(0x50)) { $0 ^ $1 }
+        suite.expect(BrightnessSupport.parseReply(wrongOpcode, code: 0x10) == nil,
+               "a checksummed packet that is not a Get VCP reply reads as no reply")
 
         suite.expect(BrightnessSupport.sanitizedMaximum(0) == 100 && BrightnessSupport.sanitizedMaximum(255) == 255,
                "a display reporting no range falls back to the conventional scale")
