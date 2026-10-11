@@ -52,6 +52,8 @@ enum BrightnessSupport {
     static let writeCycles = 2
     static let retryAttempts = 4
     static let replyLength = 11
+    /// Opcode a display puts in byte 2 of a Get VCP Feature reply.
+    static let getVCPReplyOpcode: UInt8 = 0x02
 
     /// Discovery keeps the normal number of reply chances. Every attempt but
     /// the last sends one request before its read, so the read and retry
@@ -133,12 +135,17 @@ enum BrightnessSupport {
     }
 
     /// Parses a Get VCP Feature reply: checksum first (seeded with the host
-    /// address the display answers to), then the big-endian maximum and
-    /// current values. Anything malformed reads as no reply.
-    static func parseReply(_ reply: [UInt8]) -> (current: UInt16, maximum: UInt16)? {
+    /// address the display answers to), then the reply opcode and the VCP
+    /// code it answers, then the big-endian maximum and current values.
+    /// Anything malformed reads as no reply. Some monitors fall one reply
+    /// behind when read too soon and hand back the previous request's
+    /// answer; checking the code keeps that from reading as this control.
+    static func parseReply(_ reply: [UInt8], code: UInt8) -> (current: UInt16, maximum: UInt16)? {
         guard reply.count >= replyLength else { return nil }
         let checksum = reply[0..<(reply.count - 1)].reduce(UInt8(0x50)) { $0 ^ $1 }
-        guard checksum == reply[reply.count - 1] else { return nil }
+        guard checksum == reply[reply.count - 1],
+              reply[2] == getVCPReplyOpcode,
+              reply[4] == code else { return nil }
         let maximum = UInt16(reply[6]) << 8 | UInt16(reply[7])
         let current = UInt16(reply[8]) << 8 | UInt16(reply[9])
         return (current, maximum)
