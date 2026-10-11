@@ -990,7 +990,7 @@ def main():
           + "var monitorOutput: BrightnessSupport.MonitorSpeakerOutput? = nil { didSet { republishSystemOutput() } }\n"
           + "var outputIsMonitorSpeakers: Bool { monitorOutput != nil }\n"
           + "final class BrightnessService {\nstatic let shared = BrightnessService()\nvar writes: [String] = []\n"
-          + "func setVolume(_ value: Double, for id: UInt32) { writes.append(\"volume \\(id) \\(value)\") }\n"
+          + "func setVolume(_ value: Double, for id: UInt32, raises: Bool = true) { writes.append(\"volume \\(id) \\(value)\" + (raises ? \"\" : \" lower\")) }\n"
           + "func setMuted(_ muted: Bool, for id: UInt32) { writes.append(\"muted \\(id) \\(muted)\") }\n}\n"
           + "var outputControlListenerDevice: AudioObjectID?\n"
           + "var outputControlListenerAddresses: [AudioObjectPropertyAddress] = []\n"

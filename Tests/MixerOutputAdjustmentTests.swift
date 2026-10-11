@@ -1103,10 +1103,10 @@ enum MixerOutputAdjustmentContract {
 
         // Monitor speakers take the request on the brightness queue; the HAL is never written.
         let speakers = Mixer.BrightnessService.shared
-        func monitorMixer(muted: Bool?) -> Mixer {
+        func monitorMixer(muted: Bool?, volume: Double = 0.4) -> Mixer {
             let mixer = make()
             speakers.writes = []
-            mixer.monitorOutput = BrightnessSupport.MonitorSpeakerOutput(displayID: 7, volume: 0.4, muted: muted)
+            mixer.monitorOutput = BrightnessSupport.MonitorSpeakerOutput(displayID: 7, volume: volume, muted: muted)
             return mixer
         }
         mixer = monitorMixer(muted: false)
@@ -1117,11 +1117,20 @@ enum MixerOutputAdjustmentContract {
                      "a monitor's volume slider writes its own DDC level, never the output's HAL volume")
         mixer = monitorMixer(muted: true)
         mixer.requestOutputStep(level: { _ in 0.5 }, raises: true)
-        suite.expect(speakers.writes == ["muted 7 false", "volume 7 0.5"],
-                     "a raise lifts a monitor's mute before it sets the level")
+        suite.expect(speakers.writes == ["volume 7 0.5"],
+                     "a raise hands the monitor its new level as a raise, so the mute rule can lift a mute")
         mixer = monitorMixer(muted: true)
         mixer.requestOutputStep(level: { _ in 0.3 })
-        suite.expect(speakers.writes == ["volume 7 0.3"], "a lower step leaves a monitor muted")
+        suite.expect(speakers.writes == ["volume 7 0.3 lower"],
+                     "a lower step is handed over as a lower, which leaves a chosen mute in place")
+        mixer = monitorMixer(muted: false, volume: 0.0625)
+        mixer.requestOutputStep(level: { $0 - 0.0625 - 0.5 })
+        suite.expect(speakers.writes == ["volume 7 0.0 lower"],
+                     "a step past zero hands the monitor zero, not a negative level")
+        mixer = monitorMixer(muted: true)
+        mixer.requestOutputAdjustment(volume: 0.6)
+        suite.expect(speakers.writes == ["volume 7 0.6"],
+                     "a slider set is handed over as a raise, as a slider move lifts mute elsewhere")
         mixer = monitorMixer(muted: nil)
         var noMuteDone: Bool?
         mixer.requestOutputMuteToggle { noMuteDone = $0 }

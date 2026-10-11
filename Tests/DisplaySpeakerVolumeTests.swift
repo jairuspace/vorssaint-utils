@@ -37,11 +37,25 @@ enum DisplaySpeakerVolumeTests {
                      && !BrightnessSupport.displayOwnsOutputVolume(
                         transport: kAudioDeviceTransportTypeBuiltIn, outputHasSettableVolume: false),
                      "keys reach a monitor only when its output cannot take macOS volume")
-        suite.expect(BrightnessSupport.unmutesOnStep(muted: true, raises: true)
-                     && !BrightnessSupport.unmutesOnStep(muted: true, raises: false)
-                     && !BrightnessSupport.unmutesOnStep(muted: false, raises: true)
-                     && !BrightnessSupport.unmutesOnStep(muted: nil, raises: true),
-                     "only a raise on a muted output lifts its mute")
+        typealias Mute = BrightnessSupport
+        suite.expect(Mute.monitorMuteChange(from: 0.0625, muted: false, to: 0, raises: false) == true
+                     && Mute.monitorMuteChange(from: 0, muted: true, to: 0, raises: false) == nil,
+                     "reaching zero mutes a monitor once, as macOS does for its own outputs")
+        suite.expect(Mute.monitorMuteChange(from: 0, muted: false, to: 0.0625, raises: true) == false,
+                     "leaving zero unmutes even when the last reading said unmuted, for monitors that mute themselves")
+        suite.expect(Mute.monitorMuteChange(from: 0.4, muted: true, to: 0.5, raises: true) == false
+                     && Mute.monitorMuteChange(from: 0.4, muted: true, to: 0.3, raises: false) == nil
+                     && Mute.monitorMuteChange(from: 0.4, muted: false, to: 0.5, raises: true) == nil,
+                     "a raise lifts a chosen mute, a lower leaves it, and an audible step writes no mute")
+        suite.expect(Mute.monitorMuteChange(from: 0.0625, muted: nil, to: 0, raises: false) == nil
+                     && Mute.monitorMuteChange(from: 0, muted: nil, to: 0.0625, raises: true) == nil,
+                     "a monitor without an MCCS mute control never gets a mute write")
+        suite.expect(Mute.unmutesAfterLevel(muted: false, volume: 0.01)
+                     && !Mute.unmutesAfterLevel(muted: true, volume: 0)
+                     && !Mute.unmutesAfterLevel(muted: false, volume: nil)
+                     && !Mute.unmutesAfterLevel(muted: false, volume: 0)
+                     && !Mute.unmutesAfterLevel(muted: nil, volume: 0.5),
+                     "an unmute that leaves zero follows the level write, since monitors refuse it at zero")
 
         let monitors: [(id: UInt32, name: String)] = [(2, "LG HDR 4K"), (3, "DELL U2720Q")]
         suite.expect(BrightnessSupport.displayForAudioOutput(deviceName: "DELL U2720Q",

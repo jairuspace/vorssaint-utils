@@ -783,10 +783,28 @@ enum BrightnessSupport {
         let muted: Bool?
     }
 
-    /// A raise on a muted output lifts the mute, the same as on the built-in
-    /// speakers; a lower leaves the mute where it is.
-    static func unmutesOnStep(muted: Bool?, raises: Bool) -> Bool {
-        muted == true && raises
+    /// The mute write that goes with one level change on a monitor's speakers,
+    /// or nil for none. Many monitors mute themselves when their volume hits
+    /// zero and then ignore volume writes until told to unmute, while the
+    /// mute this app last read still says unmuted. So reaching zero writes
+    /// mute on, as macOS does for its own outputs, and leaving zero always
+    /// writes mute off whatever the last reading said. A raise (or a slider
+    /// set) also lifts a mute the person chose; a lower leaves it in place.
+    /// A monitor without an MCCS mute control gets no mute writes at all.
+    static func monitorMuteChange(from current: Double, muted: Bool?,
+                                  to level: Double, raises: Bool) -> Bool? {
+        guard let muted else { return nil }
+        if level <= 0 { return muted ? nil : true }
+        if current <= 0 || (muted && raises) { return false }
+        return nil
+    }
+
+    /// Whether a queued unmute should follow the level write instead of
+    /// preceding it. Monitors ignore an unmute while their own volume is zero,
+    /// so leaving zero sets the new level first; a mute still goes first, so
+    /// the speakers fall silent before the level drops.
+    static func unmutesAfterLevel(muted: Bool?, volume: Double?) -> Bool {
+        muted == false && (volume ?? 0) > 0
     }
 
     /// Which monitor the sound is coming out of. A single display is the whole
