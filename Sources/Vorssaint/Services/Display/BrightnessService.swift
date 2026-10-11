@@ -209,6 +209,17 @@ final class BrightnessService: ObservableObject {
     /// monitor has speakers looks exactly like a scan that never asked, and
     /// taking one for the other would rescan on every preference read.
     private var scannedAudio = false
+    /// The speaker setting a forced scan has already been queued for, until a
+    /// scan completes. Without it every preference sync during that scan
+    /// forced another, which superseded the one in flight, so none finished
+    /// and the monitors were read over and over at launch. Under stateLock.
+    private var audioScanQueued: Bool?
+    /// Remembered write-only paths read again since the last wake or display
+    /// change while monitor speakers are wanted. Speakers are only probed
+    /// after brightness answers, so one failed read would otherwise hide them
+    /// for good; reading a truly write-only path on every scan would cost
+    /// every panel opening its failed retries. Touched only on the work queue.
+    private var recheckedWriteOnlyPaths = Set<String>()
     /// The monitor the volume keys reach, sampled for the volume-key tap. The
     /// tap answers from this under keyThreadLock and never waits on CoreAudio
     /// or published state. Recomputed on main when the default output changes
@@ -506,9 +517,11 @@ final class BrightnessService: ObservableObject {
         // them, and switching them off has to drop what was found: neither is
         // a topology change, so the scan has to be forced.
         stateLock.lock()
-        let covered = scannedAudio
+        let needsAudioScan = wanted && running && BrightnessSupport.needsAudioScan(
+            wanted: wantsMonitorVolume, scanned: scannedAudio, queued: audioScanQueued)
+        if needsAudioScan { audioScanQueued = wantsMonitorVolume }
         stateLock.unlock()
-        if wanted, running, wantsMonitorVolume != covered { refresh(force: true) }
+        if needsAudioScan { refresh(force: true) }
         // Knowing which monitor carries the sound is only worth a CoreAudio
         // observer while its speakers are on: the level shown and the keys follow it.
         if running, wantsMonitorVolume { installAudioOutputObserver() } else { removeAudioOutputObserver() }
@@ -619,6 +632,7 @@ final class BrightnessService: ObservableObject {
         pendingLevels = [:]
         pendingAudio = [:]
         scannedAudio = false
+        audioScanQueued = nil
         writeSequence = 0
         systemWritesInFlight = []
         lastApplied = [:]
@@ -1926,10 +1940,17 @@ final class BrightnessService: ObservableObject {
             self.restoreDeferredDisplays(retryFailures: true)
             guard self.running else { return }
             Self.log.log("woke from sleep; rebuilding display routes")
+            self.forgetWriteOnlyRechecks()
             self.refresh(force: true)
         }
         wakeRebuild = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.wakeSettleDelay, execute: work)
+    }
+
+    /// A wake can bring a monitor back able to answer, so a path remembered as
+    /// write-only is read once more on the scans that follow.
+    private func forgetWriteOnlyRechecks() {
+        workQueue.async { [weak self] in self?.recheckedWriteOnlyPaths = [] }
     }
 
     // MARK: - Rebuild (work queue)
@@ -2030,6 +2051,7 @@ final class BrightnessService: ObservableObject {
         let discoveryIsCurrent = generation == rebuildGeneration
         let canPublishDiscovery = discoveryIsCurrent && topologyChanged
         if discoveryIsCurrent {
+            if topologyChanged { recheckedWriteOnlyPaths = [] }
             // The power control only becomes safe when it sees the new active
             // set. Brightness routes remain untouched until probing finishes.
             recordDiscoveredTopology(online: seenTopology, active: activeTopology,
@@ -2110,13 +2132,18 @@ final class BrightnessService: ObservableObject {
                     softwarePathKeys[id] = pathKey
                     continue
                 }
-                let rememberedWriteOnly = !BrightnessSupport.shouldProbe(
-                    pathKey: pathKey, rememberedPaths: writeOnlyDDCPaths())
+                let writeOnlyPaths = writeOnlyDDCPaths()
+                let rememberedWriteOnly = !BrightnessSupport.shouldProbeLuminance(
+                    pathKey: pathKey, writeOnlyPaths: writeOnlyPaths,
+                    probesAudio: probesAudio, recheckedPaths: recheckedWriteOnlyPaths)
                 let probe: DDCProbe
                 if rememberedWriteOnly {
                     probe = .writeOnly
                     Self.log.log("ddc cached display \(id): writeOnly")
                 } else {
+                    if let pathKey, writeOnlyPaths.contains(pathKey) {
+                        recheckedWriteOnlyPaths.insert(pathKey)
+                    }
                     probe = ddcProbe(BrightnessSupport.luminanceCode, for: id, service: matched.service,
                                      classifyingChannel: true)
                     Self.log.log("ddc probe display \(id): \(String(describing: probe), privacy: .public)")
@@ -2284,6 +2311,7 @@ final class BrightnessService: ObservableObject {
             }
             routes = newRoutes
             scannedAudio = probesAudio
+            audioScanQueued = nil
             recordDiscoveredTopology(online: seenTopology, active: activeTopology,
                                      fingerprints: fingerprints)
             rebuildingTopology = nil

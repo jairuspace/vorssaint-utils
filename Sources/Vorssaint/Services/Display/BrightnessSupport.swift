@@ -207,6 +207,24 @@ enum BrightnessSupport {
         return !rememberedPaths.contains(pathKey)
     }
 
+    /// Whether a scan reads a monitor's brightness. A path remembered as
+    /// write-only is normally trusted, but speakers are only probed after
+    /// brightness answers, so one failed read would hide them until the
+    /// entry is cleared. While speakers are wanted, such a path is read
+    /// again once per wake or display change instead.
+    static func shouldProbeLuminance(pathKey: String?, writeOnlyPaths: Set<String>,
+                                     probesAudio: Bool, recheckedPaths: Set<String>) -> Bool {
+        guard let pathKey, writeOnlyPaths.contains(pathKey) else { return true }
+        return probesAudio && !recheckedPaths.contains(pathKey)
+    }
+
+    /// Whether a preference sync has to force a scan for the speaker setting:
+    /// only when the last finished scan did not cover it and no scan has been
+    /// queued for it yet. Forcing again would supersede the queued scan.
+    static func needsAudioScan(wanted: Bool, scanned: Bool, queued: Bool?) -> Bool {
+        wanted != scanned && queued != wanted
+    }
+
     // MARK: - Display switching
 
     enum DisplayConfigurationResult: Equatable {
