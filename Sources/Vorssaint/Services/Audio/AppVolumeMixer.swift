@@ -553,16 +553,19 @@ final class AppVolumeMixer: ObservableObject {
 
     /// Moves the monitor's own speakers through the brightness work queue, so
     /// they share one DDC client and its pacing with the backlight. Mute is
-    /// written only for a monitor that has an MCCS mute control.
+    /// written only for a monitor that has an MCCS mute control; a level
+    /// brings the mute that goes with it (BrightnessService.setVolume).
     @discardableResult
     private func writeMonitorSpeakers(_ monitor: BrightnessSupport.MonitorSpeakerOutput,
-                                      volume: Double? = nil, muted: Bool? = nil) -> Bool {
+                                      volume: Double? = nil, muted: Bool? = nil,
+                                      raises: Bool = true) -> Bool {
         if let muted {
             guard monitor.muted != nil else { return false }
             BrightnessService.shared.setMuted(muted, for: monitor.displayID)
         }
         if let volume {
-            BrightnessService.shared.setVolume(min(1, max(0, volume)), for: monitor.displayID)
+            BrightnessService.shared.setVolume(min(1, max(0, volume)), for: monitor.displayID,
+                                               raises: raises)
         }
         return true
     }
@@ -574,8 +577,8 @@ final class AppVolumeMixer: ObservableObject {
     func requestOutputAdjustment(volume: Double? = nil, muted: Bool? = nil,
                                  completion: @escaping (Bool) -> Void = { _ in }) {
         if let monitor = monitorOutput {
-            completion(volume?.isFinite != false
-                       && writeMonitorSpeakers(monitor, volume: volume, muted: muted))
+            guard volume?.isFinite != false else { completion(false); return }
+            completion(writeMonitorSpeakers(monitor, volume: volume, muted: muted))
             return
         }
         requestCoreAudioOutputAdjustment(volume: volume, muted: muted, completion: completion)
@@ -624,12 +627,9 @@ final class AppVolumeMixer: ObservableObject {
                            completion: @escaping (Bool) -> Void = { _ in }) {
         if let monitor = monitorOutput {
             // The monitor keeps its stored level while muted, so the step starts
-            // from it, and a raise lifts the mute first as a raise does on the
-            // built-in speakers.
-            if BrightnessSupport.unmutesOnStep(muted: monitor.muted, raises: raises) {
-                writeMonitorSpeakers(monitor, muted: false)
-            }
-            completion(writeMonitorSpeakers(monitor, volume: level(monitor.volume)))
+            // from it; the mute that goes with the new level is decided where
+            // the level is queued.
+            completion(writeMonitorSpeakers(monitor, volume: level(monitor.volume), raises: raises))
             return
         }
         enqueueOutputKey(OutputStep(level: level, completion: completion),

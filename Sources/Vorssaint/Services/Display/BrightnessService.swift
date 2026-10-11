@@ -2392,20 +2392,24 @@ final class BrightnessService: ObservableObject {
         }
     }
 
-    /// Writes queued speaker changes for one monitor. Mute goes first, so a
-    /// volume change lands on a monitor that is already audible.
+    /// Writes queued speaker changes for one monitor. Muting goes before the
+    /// level; unmuting goes after it, because monitors refuse to unmute while
+    /// their own volume is still zero, which left a raise from zero silent.
     private func writePendingAudio(_ pending: PendingAudio,
                                    to id: CGDirectDisplayID,
                                    route: Route?) {
         guard let route, route.method == .ddc,
               let service = route.service, let audio = route.audio else { return }
-        if let muted = pending.muted, audio.supportsMute {
+        let muted = audio.supportsMute ? pending.muted : nil
+        func writeMute(_ muted: Bool) {
             let written = ddcSend(to: id, service: service,
                                   packet: BrightnessSupport.writePacket(
                                       code: BrightnessSupport.audioMuteCode,
                                       value: BrightnessSupport.muteDeviceValue(muted)))
             Self.log.log("wrote display \(id) mute \(muted) ok \(written)")
         }
+        let unmutesLast = BrightnessSupport.unmutesAfterLevel(muted: muted, volume: pending.volume)
+        if let muted, !unmutesLast { writeMute(muted) }
         if let volume = pending.volume {
             let written = ddcSend(to: id, service: service,
                                   packet: BrightnessSupport.writePacket(
@@ -2414,6 +2418,7 @@ final class BrightnessService: ObservableObject {
                                           for: volume, maximum: audio.maximum)))
             Self.log.log("wrote display \(id) volume \(volume) ok \(written)")
         }
+        if let muted, unmutesLast { writeMute(muted) }
     }
 
     /// A key step reaches a system display the way the system's own keys do:
@@ -2739,24 +2744,36 @@ final class BrightnessService: ObservableObject {
 
     /// Moves one monitor's own speakers, the same way the slider moves its
     /// backlight: the published value updates on the spot and a drag folds
-    /// into one write of the newest value.
-    func setVolume(_ value: Double, for id: CGDirectDisplayID) {
+    /// into one write of the newest value. The mute that goes with the level
+    /// (on at zero, off when leaving zero or on a raise) is decided here, so
+    /// every control behaves alike, and queued with the level in one change:
+    /// queued apart, the work queue could send the unmute on its own while
+    /// the monitor's volume was still zero, and the monitor ignores that.
+    func setVolume(_ value: Double, for id: CGDirectDisplayID, raises: Bool = true) {
         let clamped = min(max(value, 0), 1)
-        if let index = displays.firstIndex(where: { $0.id == id }),
-           displays[index].audio?.volume != clamped {
-            displays[index].audio?.volume = clamped
+        let mute = displays.first(where: { $0.id == id })?.audio.flatMap {
+            BrightnessSupport.monitorMuteChange(from: $0.volume, muted: $0.muted,
+                                                to: clamped, raises: raises)
         }
-        queueAudio(for: id) { $0.volume = clamped }
+        setSpeakers(volume: clamped, muted: mute, for: id)
     }
 
     /// Mutes or unmutes a monitor that offers the control. Monitors without
     /// one keep their volume slider and never show a mute button.
     func setMuted(_ muted: Bool, for id: CGDirectDisplayID) {
-        if let index = displays.firstIndex(where: { $0.id == id }),
-           displays[index].audio?.muted != nil {
-            displays[index].audio?.muted = muted
+        setSpeakers(volume: nil, muted: muted, for: id)
+    }
+
+    private func setSpeakers(volume: Double?, muted: Bool?, for id: CGDirectDisplayID) {
+        if let index = displays.firstIndex(where: { $0.id == id }), var audio = displays[index].audio {
+            if let volume { audio.volume = volume }
+            if let muted, audio.muted != nil { audio.muted = muted }
+            if displays[index].audio != audio { displays[index].audio = audio }
         }
-        queueAudio(for: id) { $0.muted = muted }
+        queueAudio(for: id) { pending in
+            if let volume { pending.volume = volume }
+            if let muted { pending.muted = muted }
+        }
     }
 
     /// Tap-side answer for a volume key: whether the press belongs to the
