@@ -163,7 +163,12 @@ final class PreciseVolumeRollerService: ObservableObject {
         if press.isRepeat, case .toggleMute = press.action {
             return monitorVolumeKeysHeld.contains(press.action)
         }
-        guard BrightnessService.shared.claimsMonitorVolumeKey(press.action) else { return false }
+        guard BrightnessService.shared.claimsMonitorVolumeKey(press.action) else {
+            if !press.isRepeat {
+                DispatchQueue.main.async { BrightnessService.shared.rescanForUnclaimedVolumeKey() }
+            }
+            return false
+        }
         monitorVolumeKeysHeld.insert(press.action)
         let action = press.action
         // The precise volume setting applies to the monitor as it does to any
