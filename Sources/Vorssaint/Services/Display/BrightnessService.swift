@@ -220,6 +220,16 @@ final class BrightnessService: ObservableObject {
     /// for good; reading a truly write-only path on every scan would cost
     /// every panel opening its failed retries. Touched only on the work queue.
     private var recheckedWriteOnlyPaths = Set<String>()
+    /// Paths whose brightness answered at least once since launch. Only these
+    /// earn a retry after a failed read. Touched only on the work queue.
+    private var ddcRepliedPaths = Set<String>()
+    /// Retries spent per path since the last wake or display change. Touched
+    /// only on the work queue.
+    private var ddcRetryAttempts: [String: Int] = [:]
+    /// The scan waiting to read a failed monitor again. Main thread only.
+    private var ddcRetry: DispatchWorkItem?
+    /// Uptime of the last rescan a volume key started. Main thread only.
+    private var lastVolumeKeyRescan: TimeInterval?
     /// The monitor the volume keys reach, sampled for the volume-key tap. The
     /// tap answers from this under keyThreadLock and never waits on CoreAudio
     /// or published state. Recomputed on main when the default output changes
@@ -684,6 +694,8 @@ final class BrightnessService: ObservableObject {
         let generation = rebuildGeneration
         rebuildingTopology = topology
         stateLock.unlock()
+        ddcRetry?.cancel()
+        ddcRetry = nil
         let screenNames = Self.localizedScreenNames()
         workQueue.async { [weak self] in
             self?.rebuild(generation: generation, previousDisplays: previousDisplays,
@@ -1935,6 +1947,8 @@ final class BrightnessService: ObservableObject {
     private func displaysWokeUp() {
         guard running || !deferredRestoration.ids.isEmpty else { return }
         wakeRebuild?.cancel()
+        ddcRetry?.cancel()
+        ddcRetry = nil
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.running || !self.deferredRestoration.ids.isEmpty else { return }
             self.restoreDeferredDisplays(retryFailures: true)
@@ -1948,9 +1962,20 @@ final class BrightnessService: ObservableObject {
     }
 
     /// A wake can bring a monitor back able to answer, so a path remembered as
-    /// write-only is read once more on the scans that follow.
+    /// write-only is read once more on the scans that follow, with a fresh
+    /// retry budget.
     private func forgetWriteOnlyRechecks() {
-        workQueue.async { [weak self] in self?.recheckedWriteOnlyPaths = [] }
+        workQueue.async { [weak self] in
+            self?.recheckedWriteOnlyPaths = []
+            self?.ddcRetryAttempts = [:]
+        }
+    }
+
+    private func scheduleDDCRetry(after delay: TimeInterval) {
+        ddcRetry?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refresh(force: true) }
+        ddcRetry = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     // MARK: - Rebuild (work queue)
@@ -2051,7 +2076,10 @@ final class BrightnessService: ObservableObject {
         let discoveryIsCurrent = generation == rebuildGeneration
         let canPublishDiscovery = discoveryIsCurrent && topologyChanged
         if discoveryIsCurrent {
-            if topologyChanged { recheckedWriteOnlyPaths = [] }
+            if topologyChanged {
+                recheckedWriteOnlyPaths = []
+                ddcRetryAttempts = [:]
+            }
             // The power control only becomes safe when it sees the new active
             // set. Brightness routes remain untouched until probing finishes.
             recordDiscoveredTopology(online: seenTopology, active: activeTopology,
@@ -2096,6 +2124,7 @@ final class BrightnessService: ObservableObject {
         var forcedSoftwareIDs = Set<CGDirectDisplayID>()
         var extendedDimmingIDs = Set<CGDirectDisplayID>()
         var softwarePathKeys: [CGDirectDisplayID: String] = [:]
+        var retryDelay: TimeInterval?
         if !ddcCandidates.isEmpty, BrightnessBridge.ddcAvailable {
             let services = Self.externalServices()
             var scores: [(displayIndex: Int, serviceOrdinal: Int, score: Int)] = []
@@ -2151,6 +2180,10 @@ final class BrightnessService: ObservableObject {
                 switch probe {
                 case .replied(let current, let maximum):
                     forgetWriteOnlyDDCPath(pathKey)
+                    if let pathKey {
+                        ddcRepliedPaths.insert(pathKey)
+                        ddcRetryAttempts[pathKey] = nil
+                    }
                     // Only a channel that answered brightness is asked about its
                     // speakers, on this same queue and pacing.
                     let audio = probesAudio
@@ -2199,6 +2232,17 @@ final class BrightnessService: ObservableObject {
                         extendedDimmingIDs.insert(id)
                     }
                     rememberWriteOnlyDDCPath(pathKey)
+                    if !rememberedWriteOnly, let pathKey {
+                        let attempt = (ddcRetryAttempts[pathKey] ?? 0) + 1
+                        if let delay = BrightnessSupport.ddcRetryDelay(
+                            attempt: attempt, probesAudio: probesAudio,
+                            repliedThisSession: ddcRepliedPaths.contains(pathKey)) {
+                            ddcRetryAttempts[pathKey] = attempt
+                            recheckedWriteOnlyPaths.remove(pathKey)
+                            retryDelay = min(retryDelay ?? delay, delay)
+                            Self.log.log("ddc retry display \(id) attempt \(attempt) in \(delay)s")
+                        }
+                    }
                     // Reads fail on some monitors whose writes still work:
                     // keep the slider, seeded from this session's last value.
                     stateLock.lock()
@@ -2343,6 +2387,7 @@ final class BrightnessService: ObservableObject {
             self.refreshKeyboardLight()
             self.refreshAudioKeyTarget()
             self.syncKeyTap()
+            if let retryDelay { self.scheduleDDCRetry(after: retryDelay) }
         }
     }
 
@@ -2814,6 +2859,26 @@ final class BrightnessService: ObservableObject {
             if case .toggleMute = action { return target.supportsMute }
             return true
         }
+    }
+
+    /// A volume key no monitor claimed while the sound leaves through a
+    /// monitor: its speakers may have been hidden by a failed read, so the
+    /// displays are scanned again, remembered write-only paths included. The
+    /// press itself stays with macOS. Main thread only.
+    func rescanForUnclaimedVolumeKey() {
+        guard wantsMonitorVolumeKeys, let output = Self.defaultOutputDevice() else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let hasTarget = keyThreadLock.withLock { audioKeyTarget != nil }
+        guard BrightnessSupport.rescansForVolumeKey(
+            hasTarget: hasTarget,
+            displayOwnsOutput: BrightnessSupport.displayOwnsOutputVolume(
+                transport: output.transport,
+                outputHasSettableVolume: AppVolumeMixer.hasSettableOutputVolume(for: output.id)),
+            now: now, lastRescan: lastVolumeKeyRescan) else { return }
+        lastVolumeKeyRescan = now
+        Self.log.log("volume key without target; rescanning")
+        workQueue.async { [weak self] in self?.recheckedWriteOnlyPaths = [] }
+        refresh(force: true)
     }
 
     /// The monitor whose speakers carry the sound, when its speakers are on and

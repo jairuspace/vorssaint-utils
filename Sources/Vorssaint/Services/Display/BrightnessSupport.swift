@@ -225,6 +225,32 @@ enum BrightnessSupport {
         wanted != scanned && queued != wanted
     }
 
+    static let ddcRetryDelays: [TimeInterval] = [2, 5, 15]
+
+    /// How long to wait before reading a monitor again after a brightness
+    /// read failed, or nil when its write-only answer stands. A monitor that
+    /// answered earlier this session can still be renegotiating its link
+    /// after a wake or a dropout, and one failed read would hide its speakers
+    /// until the next wake. `attempt` counts from 1.
+    static func ddcRetryDelay(attempt: Int, probesAudio: Bool,
+                              repliedThisSession: Bool) -> TimeInterval? {
+        guard probesAudio, repliedThisSession,
+              attempt >= 1, attempt <= ddcRetryDelays.count else { return nil }
+        return ddcRetryDelays[attempt - 1]
+    }
+
+    static let volumeKeyRescanInterval: TimeInterval = 10
+
+    /// Whether a volume key that no monitor claimed rescans the displays: only
+    /// while the sound leaves through a monitor that should own it and has no
+    /// route yet, and at most once per interval.
+    static func rescansForVolumeKey(hasTarget: Bool, displayOwnsOutput: Bool,
+                                    now: TimeInterval, lastRescan: TimeInterval?) -> Bool {
+        guard !hasTarget, displayOwnsOutput else { return false }
+        guard let lastRescan else { return true }
+        return now - lastRescan >= volumeKeyRescanInterval
+    }
+
     // MARK: - Display switching
 
     enum DisplayConfigurationResult: Equatable {

@@ -146,6 +146,7 @@ enum DisplayRestorationTests {
         var running = false
         var wakeObserversInstalled = false
         var wakeRebuild: DispatchWorkItem?
+        var ddcRetry: DispatchWorkItem?
         static let wakeSettleDelay: TimeInterval = 3
         static func lidClosed() -> Bool? { Hardware.lidRead?() ?? Hardware.lid }
         static func currentTopology() -> BrightnessSupport.DisplayTopology {
