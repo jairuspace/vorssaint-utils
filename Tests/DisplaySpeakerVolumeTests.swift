@@ -138,6 +138,27 @@ enum DisplaySpeakerVolumeTests {
                      && BrightnessSupport.shouldProbeLuminance(pathKey: nil, writeOnlyPaths: ["a"],
                         probesAudio: false, recheckedPaths: []),
                      "a remembered write-only path is read again once while speakers are wanted, then trusted")
+        suite.expect(BrightnessSupport.ddcRetryDelay(attempt: 1, probesAudio: true, repliedThisSession: true) == 2
+                     && BrightnessSupport.ddcRetryDelay(attempt: 2, probesAudio: true, repliedThisSession: true) == 5
+                     && BrightnessSupport.ddcRetryDelay(attempt: 3, probesAudio: true, repliedThisSession: true) == 15,
+                     "a monitor that answered before is read again after about 2, 5 and 15 seconds")
+        suite.expect(BrightnessSupport.ddcRetryDelay(attempt: 4, probesAudio: true, repliedThisSession: true) == nil,
+                     "the write-only answer stands once the third retry fails")
+        suite.expect(BrightnessSupport.ddcRetryDelay(attempt: 1, probesAudio: false, repliedThisSession: true) == nil
+                     && BrightnessSupport.ddcRetryDelay(attempt: 1, probesAudio: true, repliedThisSession: false) == nil,
+                     "a failed read is retried only while speakers are wanted and the monitor answered this session")
+        suite.expect(BrightnessSupport.rescansForVolumeKey(hasTarget: false, displayOwnsOutput: true,
+                        now: 100, lastRescan: nil)
+                     && !BrightnessSupport.rescansForVolumeKey(hasTarget: true, displayOwnsOutput: true,
+                        now: 100, lastRescan: nil)
+                     && !BrightnessSupport.rescansForVolumeKey(hasTarget: false, displayOwnsOutput: false,
+                        now: 100, lastRescan: nil),
+                     "an unclaimed volume key rescans only while a monitor output has no target")
+        suite.expect(!BrightnessSupport.rescansForVolumeKey(hasTarget: false, displayOwnsOutput: true,
+                        now: 109, lastRescan: 100)
+                     && BrightnessSupport.rescansForVolumeKey(hasTarget: false, displayOwnsOutput: true,
+                        now: 110, lastRescan: 100),
+                     "volume keys rescan at most once every 10 seconds")
         suite.expect(BrightnessSupport.needsAudioScan(wanted: true, scanned: false, queued: nil)
                      && !BrightnessSupport.needsAudioScan(wanted: true, scanned: false, queued: true)
                      && !BrightnessSupport.needsAudioScan(wanted: true, scanned: true, queued: nil)
