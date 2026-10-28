@@ -919,6 +919,141 @@ enum BrightnessSupport {
         return matches.isEmpty ? nil : uniqueName(in: matches)
     }
 
+    /// Whether any output device, default or not, would be matched to this
+    /// display as its speakers. That is the evidence a write-only monitor has
+    /// speakers at all, since it cannot be asked.
+    static func offersWriteOnlySpeakers(displayID: UInt32, outputs: [AudioOutputDevice],
+                                        displays: [DisplayAudioCandidate]) -> Bool {
+        outputs.contains { displayForAudioOutput($0, displays: displays) == displayID }
+    }
+
+    /// Whether a display offers the write-only speaker opt-in, and whether it
+    /// is on: nil when not offered. Only an active DDC display that never
+    /// answers a read and has a connection path qualifies, while monitor
+    /// speakers are on. It is offered with evidence of speakers and stays
+    /// offered once chosen, so it can always be turned off.
+    static func writeOnlySpeakerChoice(isActive: Bool, isDDC: Bool, readable: Bool, pathKey: String?,
+                                       speakersWanted: Bool, optedInPaths: Set<String>,
+                                       outputMatches: Bool) -> Bool? {
+        guard speakersWanted, isActive, isDDC, !readable, let pathKey, !pathKey.isEmpty else { return nil }
+        let chosen = optedInPaths.contains(pathKey)
+        return chosen || outputMatches ? chosen : nil
+    }
+
+    /// The speaker level of a monitor that takes writes but never answers a
+    /// read, in its own units. It is the only record of what the monitor is
+    /// set to, so keys step it rather than a fraction, which would round to
+    /// uneven steps. While muted, `raw` is the level to come back to and the
+    /// monitor is sent 0, since its mute control cannot be probed.
+    struct WriteOnlySpeakerLevel: Equatable {
+        /// The MCCS range assumed for a monitor that cannot report its own.
+        static let defaultMaximum = 100
+        /// A first level low enough not to startle. MonitorControl starts a
+        /// monitor whose volume it cannot read at 12.5% for the same reason.
+        static let firstUseFraction = 0.12
+
+        private(set) var raw: Int
+        private(set) var maximum: Int
+        private(set) var muted: Bool
+
+        init(raw: Int, maximum: Int = defaultMaximum, muted: Bool = false) {
+            let ceiling = (1...Int(UInt16.max)).contains(maximum) ? maximum : Self.defaultMaximum
+            self.maximum = ceiling
+            self.raw = min(max(raw, 0), ceiling)
+            self.muted = muted
+        }
+
+        init?(stored: Any?) {
+            guard let fields = stored as? [String: Any], let raw = fields["raw"] as? Int else { return nil }
+            self.init(raw: raw, maximum: fields["max"] as? Int ?? Self.defaultMaximum,
+                      muted: fields["muted"] as? Bool ?? false)
+        }
+
+        static func firstUse(maximum: Int = defaultMaximum) -> WriteOnlySpeakerLevel {
+            let ceiling = WriteOnlySpeakerLevel(raw: 0, maximum: maximum).maximum
+            return WriteOnlySpeakerLevel(raw: max(1, Int((Double(ceiling) * firstUseFraction).rounded())),
+                                         maximum: ceiling)
+        }
+
+        /// The level a monitor reported while it answered reads.
+        static func read(volume: Double, maximum: UInt16) -> WriteOnlySpeakerLevel {
+            var level = WriteOnlySpeakerLevel(raw: 0, maximum: Int(maximum))
+            level.set(volume: volume, raises: true)
+            return level
+        }
+
+        var stored: [String: Any] { ["raw": raw, "max": maximum, "muted": muted] }
+        /// A sixteenth of the range, as the system's own volume keys step.
+        var standardStep: Int { max(1, Int((Double(maximum) / 16).rounded())) }
+        var deviceValue: UInt16 { muted ? 0 : UInt16(raw) }
+        var volume: Double { Double(raw) / Double(maximum) }
+
+        /// A key step. A step while muted unmutes from the level before the
+        /// mute, so silence never hides how loud the next press will be.
+        mutating func step(direction: Int, fine: Bool) {
+            let delta = fine ? 1 : standardStep
+            raw = min(max(raw + (direction >= 0 ? delta : -delta), 0), maximum)
+            muted = false
+        }
+
+        mutating func toggleMute() {
+            muted.toggle()
+        }
+
+        mutating func setMuted(_ muted: Bool) {
+            self.muted = muted
+        }
+
+        /// A slider or mixer level. A raise lifts a mute, as it does for
+        /// monitors with a mute control; a lower leaves it.
+        mutating func set(volume: Double, raises: Bool) {
+            guard volume.isFinite else { return }
+            raw = Int((min(max(volume, 0), 1) * Double(maximum)).rounded())
+            if raises { muted = false }
+        }
+    }
+
+    /// The speakers a scan builds for a write-only path: only while monitor
+    /// speakers are on and the path is opted in, at the stored level or the
+    /// low first-use one.
+    static func writeOnlySpeakerLevel(probesAudio: Bool, pathKey: String?, optedInPaths: Set<String>,
+                                      storedLevels: [String: Any]?) -> WriteOnlySpeakerLevel? {
+        guard probesAudio, let pathKey, optedInPaths.contains(pathKey) else { return nil }
+        return WriteOnlySpeakerLevel(stored: storedLevels?[pathKey]) ?? .firstUse()
+    }
+
+    /// The displays whose starting level is due: their write-only speakers
+    /// exist now and their path was just opted in.
+    static func writeOnlySeedDisplays(paths: [UInt32: String], awaiting: Set<String>) -> [UInt32] {
+        paths.filter { awaiting.contains($0.value) }.keys.sorted()
+    }
+
+    /// The stored levels after one path's change, keeping opted-in paths only.
+    static func updatedWriteOnlySpeakerLevels(_ stored: [String: Any], path: String,
+                                              level: WriteOnlySpeakerLevel?,
+                                              optedInPaths: Set<String>) -> [String: Any] {
+        var updated = stored.filter { optedInPaths.contains($0.key) && $0.key != path }
+        if let level, optedInPaths.contains(path) { updated[path] = level.stored }
+        return updated
+    }
+
+    /// The stored levels with the levels a scan read from answering monitors,
+    /// for opted-in paths only: a path opted out after the scan read it, or
+    /// never opted in, keeps no level.
+    static func mergedReadSpeakerLevels(_ stored: [String: Any], read: [String: WriteOnlySpeakerLevel],
+                                        optedInPaths: Set<String>) -> [String: Any] {
+        var updated = stored.filter { optedInPaths.contains($0.key) }
+        for (path, level) in read where optedInPaths.contains(path) { updated[path] = level.stored }
+        return updated
+    }
+
+    /// Whether a queued write-only level may still go out when its turn comes:
+    /// the path must still be opted in and must not have started answering.
+    static func sendsWriteOnlyLevel(pathKey: String?, readable: Bool, optedInPaths: Set<String>) -> Bool {
+        guard !readable, let pathKey else { return false }
+        return optedInPaths.contains(pathKey)
+    }
+
     /// An optional lower quarter of the slider dims the picture after the
     /// monitor has reached its own minimum. The rest keeps using its backlight.
     static let extendedDimmingRange = 0.25

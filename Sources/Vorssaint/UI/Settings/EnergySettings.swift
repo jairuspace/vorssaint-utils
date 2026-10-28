@@ -58,6 +58,9 @@ struct EnergySettings: View {
                 if (focus == nil || focus == .brightness), AppFeature.brightness.isAvailable {
                     displaysCard
                         .settingsSectionAnchor(.brightness, cornerRadius: 16)
+                    if brightnessEnabled {
+                        monitorSpeakersCard
+                    }
                 }
                 if (focus == nil || focus == .extraBrightness), AppFeature.extraBrightness.isAvailable {
                     extraBrightnessCard
@@ -355,26 +358,7 @@ struct EnergySettings: View {
                                     }
                             }
                         }
-                        SettingsRow(symbol: "speaker.wave.2", title: strings.volumeToggle,
-                                    caption: strings.volumeCaption) {
-                            Toggle(strings.volumeToggle, isOn: $displayVolume)
-                                .labelsHidden()
-                                .onChange(of: displayVolume) { _, _ in
-                                    BrightnessService.shared.syncWithPreferences()
-                                }
-                        }
-                        if displayVolume {
-                            SettingsRow(symbol: "keyboard", title: strings.volumeKeysToggle,
-                                        caption: strings.volumeKeysCaption) {
-                                Toggle(strings.volumeKeysToggle, isOn: $displayVolumeKeys)
-                                    .labelsHidden()
-                                    .onChange(of: displayVolumeKeys) { _, isOn in
-                                        if isOn { Permissions.shared.requestAccessibility() }
-                                        BrightnessService.shared.syncWithPreferences()
-                                    }
-                            }
-                        }
-                        if brightnessKeysEnabled || brightnessOSDEnabled || displayVolumeKeys
+                        if brightnessKeysEnabled || brightnessOSDEnabled
                             || BrightnessSupport.KeyStep.sanitized(brightnessKeyStep) != .standard,
                            !permissions.accessibility {
                             PermissionRow(kind: .accessibility)
@@ -388,6 +372,50 @@ struct EnergySettings: View {
                 } label: {
                     Text(FeatureStrings.recorder(l10n.language).moreOptions)
                         .font(.subheadline.weight(.medium))
+                }
+            }
+        }
+    }
+
+    /// The monitors' own speakers, in a card of their own below the displays:
+    /// the setting that turns them on, then one row per monitor whose speakers
+    /// can be driven, laid out as a table, then the volume key options.
+    private var monitorSpeakersCard: some View {
+        let strings = FeatureStrings.brightness(l10n.language)
+        let monitors = brightness.displays.filter { display in
+            !display.isBuiltIn && ((display.isActive && display.audio != nil)
+                || brightness.writeOnlySpeakerChoices[display.id] != nil)
+        }
+        return SettingsCard {
+            SettingsRow(symbol: "speaker.wave.2", title: strings.volumeToggle,
+                        caption: strings.volumeCaption) {
+                Toggle(strings.volumeToggle, isOn: $displayVolume)
+                    .labelsHidden()
+                    .onChange(of: displayVolume) { _, _ in
+                        BrightnessService.shared.syncWithPreferences()
+                    }
+            }
+            if displayVolume {
+                Divider()
+                if monitors.isEmpty {
+                    Text(strings.noMonitorSpeakers)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    DisplaySpeakersTable(monitors: monitors)
+                }
+                Divider()
+                SettingsRow(symbol: "keyboard", title: strings.volumeKeysToggle,
+                            caption: strings.volumeKeysCaption) {
+                    Toggle(strings.volumeKeysToggle, isOn: $displayVolumeKeys)
+                        .labelsHidden()
+                        .onChange(of: displayVolumeKeys) { _, isOn in
+                            if isOn { Permissions.shared.requestAccessibility() }
+                            BrightnessService.shared.syncWithPreferences()
+                        }
+                }
+                if displayVolumeKeys, !permissions.accessibility {
+                    PermissionRow(kind: .accessibility)
                 }
             }
         }
