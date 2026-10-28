@@ -189,7 +189,13 @@ final class PreciseVolumeRollerService: ObservableObject {
     /// the mixer's monitor output and its request path live.
     private static func applyMonitorVolumeKey(_ action: BrightnessSupport.VolumeKeyAction, fine: Bool) {
         let mixer = AppVolumeMixer.shared
-        guard mixer.outputIsMonitorSpeakers else { return }
+        guard let monitor = mixer.monitorOutput else { return }
+        // Write-only speakers step their stored level in the monitor's own
+        // units; the mixer's fractional step would round to uneven steps.
+        if BrightnessService.shared.applyWriteOnlySpeakerKey(action, fine: fine, for: monitor.displayID) {
+            Self.showMonitorFeedback()
+            return
+        }
         switch action {
         case let .step(direction):
             mixer.requestOutputStep(level: {

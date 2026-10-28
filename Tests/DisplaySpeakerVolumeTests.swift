@@ -57,26 +57,192 @@ enum DisplaySpeakerVolumeTests {
                      && !Mute.unmutesAfterLevel(muted: nil, volume: 0.5),
                      "an unmute that leaves zero follows the level write, since monitors refuse it at zero")
 
-        let monitors: [(id: UInt32, name: String)] = [(2, "LG HDR 4K"), (3, "DELL U2720Q")]
-        suite.expect(BrightnessSupport.displayForAudioOutput(deviceName: "DELL U2720Q",
-                        candidates: monitors, connectedDisplayCount: 2) == 3
-                     && BrightnessSupport.displayForAudioOutput(deviceName: "dell u2720q",
-                        candidates: monitors, connectedDisplayCount: 2) == 3,
-                     "the sound device is matched to its display by name, ignoring case")
-        suite.expect(BrightnessSupport.displayForAudioOutput(deviceName: "LG HDR 4K Audio",
-                        candidates: monitors, connectedDisplayCount: 2) == 2,
-                     "a device name that extends the display name still matches it")
-        suite.expect(BrightnessSupport.displayForAudioOutput(deviceName: "MacBook Pro Speakers",
-                        candidates: monitors, connectedDisplayCount: 2) == nil
-                     && BrightnessSupport.displayForAudioOutput(deviceName: "",
-                        candidates: monitors, connectedDisplayCount: 2) == nil,
-                     "sound from another device or with no name never routes keys to a display")
-        let lone: [(id: UInt32, name: String)] = [(7, "Studio Display")]
-        suite.expect(BrightnessSupport.displayForAudioOutput(deviceName: "Built-in Output",
-                        candidates: lone, connectedDisplayCount: 1) == 7
-                     && BrightnessSupport.displayForAudioOutput(deviceName: "Built-in Output",
-                        candidates: lone, connectedDisplayCount: 2) == nil,
-                     "a lone candidate answers only while it is the only connected display")
+        let msiUID = "3669D23D-0000-0000-0422-0104B5462778"
+        let samsungUID = "4C2D0C75-0000-0000-0723-0104B5462878_0C80B000"
+        suite.expect(BrightnessSupport.displayAudioIdentity(uid: msiUID).map { [$0.vendor, $0.model] } == [0x3669, 0x3DD2]
+                     && BrightnessSupport.displayAudioIdentity(uid: samsungUID).map { [$0.vendor, $0.model] } == [0x4C2D, 0x750C],
+                     "a display audio UID carries the EDID vendor big-endian and the product little-endian")
+        suite.expect(BrightnessSupport.displayAudioIdentity(uid: "BuiltInSpeakerDevice") == nil
+                     && BrightnessSupport.displayAudioIdentity(uid: "3669D23") == nil
+                     && BrightnessSupport.displayAudioIdentity(uid: "3669D23DX") == nil
+                     && BrightnessSupport.displayAudioIdentity(uid: "0000D23D-0000") == nil
+                     && BrightnessSupport.displayAudioIdentity(uid: "") == nil,
+                     "a UID without the EDID prefix gives no display identity")
+
+        typealias Output = BrightnessSupport.AudioOutputDevice
+        typealias Candidate = BrightnessSupport.DisplayAudioCandidate
+        func output(_ uid: String, _ name: String = "", transport: UInt32 = kAudioDeviceTransportTypeDisplayPort,
+                    settable: Bool = false) -> Output {
+            Output(uid: uid, name: name, transport: transport, hasSettableVolume: settable, isDefault: true)
+        }
+        let desk = [Candidate(id: 1, name: "Built-in Retina Display", vendor: 0x610, model: 0xA050),
+                    Candidate(id: 3, name: "MPG321UX OLED", vendor: 0x3669, model: 0x3DD2),
+                    Candidate(id: 4, name: "Odyssey G5", vendor: 0x4C2D, model: 0x750C)]
+        suite.expect(BrightnessSupport.displayForAudioOutput(output(samsungUID), displays: desk) == 4
+                     && BrightnessSupport.displayForAudioOutput(output(msiUID), displays: desk) == 3,
+                     "the sound device is matched to its display by the EDID identity in its UID")
+        suite.expect(BrightnessSupport.displayForAudioOutput(output(msiUID, transport: kAudioDeviceTransportTypeBuiltIn),
+                                                             displays: desk) == nil
+                     && BrightnessSupport.displayForAudioOutput(output("BuiltInSpeakerDevice", "MacBook Pro Speakers",
+                                                                       transport: kAudioDeviceTransportTypeBuiltIn),
+                                                                displays: desk) == nil
+                     && BrightnessSupport.displayForAudioOutput(output("iPhone-continuity-output", "iPhone",
+                                                                       transport: kAudioDeviceTransportTypeContinuityCaptureWireless),
+                                                                displays: desk) == nil,
+                     "built-in speakers and an iPhone never route keys to a display, whatever their UID")
+        suite.expect(BrightnessSupport.displayForAudioOutput(output(msiUID, settable: true), displays: desk) == nil,
+                     "an output macOS can set the volume of never routes keys to a display")
+        let twins = [Candidate(id: 5, name: "DELL U2720Q", vendor: 0x10AC, model: 0xA0C4),
+                     Candidate(id: 6, name: "DELL U2720Q (2)", vendor: 0x10AC, model: 0xA0C4)]
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("10ACC4A0-0000-0000", "DELL U2720Q (2)"),
+                                                             displays: twins) == 6
+                     && BrightnessSupport.displayForAudioOutput(output("10ACC4A0-0000-0000", "dell u2720q"),
+                                                                displays: twins) == 5,
+                     "two monitors of the same model are told apart by the exact name, ignoring case")
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("10ACC4A0-0000-0000", "DELL U2720Q Audio"),
+                                                             displays: twins) == nil
+                     && BrightnessSupport.displayForAudioOutput(output("10ACC4A0-0000-0000"), displays: twins) == nil,
+                     "two monitors of the same model with no exact name stay with macOS")
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("1E6D0777-0000-0000"), displays: desk) == nil,
+                     "a display UID that matches no connected display routes nowhere")
+        let named = [Candidate(id: 2, name: "LG HDR 4K", vendor: 0, model: 0),
+                     Candidate(id: 3, name: "DELL U2720Q", vendor: 0, model: 0)]
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("hdmi-out", "dell u2720q"), displays: named) == 3,
+                     "without a display UID the device is matched by its exact name, ignoring case")
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("hdmi-out", "LG"), displays: named) == nil
+                     && BrightnessSupport.displayForAudioOutput(output("hdmi-out", "LG HDR 4K Audio"), displays: named) == nil
+                     && BrightnessSupport.displayForAudioOutput(output("hdmi-out", ""), displays: named) == nil,
+                     "a partial or missing name never matches a display")
+        let sameName = [Candidate(id: 2, name: "LG HDR 4K", vendor: 0, model: 0),
+                        Candidate(id: 3, name: "LG HDR 4K", vendor: 0, model: 0)]
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("hdmi-out", "LG HDR 4K"), displays: sameName) == nil,
+                     "a name shared by two displays is ambiguous and stays with macOS")
+        let lone = [Candidate(id: 7, name: "Studio Display", vendor: 0, model: 0)]
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("hdmi-out", "Display Audio"), displays: lone) == 7
+                     && BrightnessSupport.displayForAudioOutput(output("hdmi-out", "Display Audio"), displays: named) == nil,
+                     "without a display UID a lone display answers only while it is the only one active")
+        suite.expect(MixerRoutingSupport.observationNeeds(isAvailable: { _ in false }, monitorSpeakers: true) == (true, false)
+                     && MixerRoutingSupport.observationNeeds(isAvailable: { _ in false }) == (false, false),
+                     "monitor speakers watch the output devices without starting per-app mixer taps")
+
+        typealias Level = BrightnessSupport.WriteOnlySpeakerLevel
+        let firstUse = Level.firstUse()
+        suite.expect(firstUse.raw == 12 && firstUse.maximum == 100 && !firstUse.muted,
+                     "a write-only monitor's speakers start at a low 12 of 100")
+        suite.expect(BrightnessSupport.writeOnlySpeakerLevel(probesAudio: true, pathKey: "msi", optedInPaths: ["msi"],
+                                                             storedLevels: nil) == firstUse
+                     && BrightnessSupport.writeOnlySpeakerLevel(probesAudio: true, pathKey: "msi", optedInPaths: ["msi"],
+                        storedLevels: ["msi": ["raw": 40, "max": 100, "muted": true]])
+                        == Level(raw: 40, maximum: 100, muted: true),
+                     "an opted-in write-only path gets speakers at its stored level, or the low first-use level")
+        suite.expect(BrightnessSupport.writeOnlySpeakerLevel(probesAudio: true, pathKey: "msi", optedInPaths: [],
+                        storedLevels: ["msi": ["raw": 40]]) == nil
+                     && BrightnessSupport.writeOnlySpeakerLevel(probesAudio: false, pathKey: "msi", optedInPaths: ["msi"],
+                        storedLevels: nil) == nil
+                     && BrightnessSupport.writeOnlySpeakerLevel(probesAudio: true, pathKey: nil, optedInPaths: ["msi"],
+                        storedLevels: nil) == nil,
+                     "a write-only path gets no speakers without the opt-in, the speaker setting or a path")
+
+        let outputs = [output(msiUID, "MPG321UX OLED"),
+                       output("BuiltInSpeakerDevice", "MacBook Pro Speakers", transport: kAudioDeviceTransportTypeBuiltIn,
+                              settable: true)]
+        suite.expect(BrightnessSupport.offersWriteOnlySpeakers(displayID: 3, outputs: outputs, displays: desk)
+                     && !BrightnessSupport.offersWriteOnlySpeakers(displayID: 4, outputs: outputs, displays: desk)
+                     && !BrightnessSupport.offersWriteOnlySpeakers(displayID: 3, outputs: [output(msiUID, settable: true)],
+                                                                   displays: desk),
+                     "the speaker opt-in is offered only for a display a fixed-volume display output matches")
+        func choice(active: Bool = true, ddc: Bool = true, readable: Bool = false, path: String? = "msi",
+                    wanted: Bool = true, optedIn: Set<String> = [], matches: Bool = true) -> Bool? {
+            BrightnessSupport.writeOnlySpeakerChoice(isActive: active, isDDC: ddc, readable: readable, pathKey: path,
+                                                     speakersWanted: wanted, optedInPaths: optedIn,
+                                                     outputMatches: matches)
+        }
+        suite.expect(choice() == false && choice(optedIn: ["msi"]) == true
+                     && choice(matches: false) == nil && choice(optedIn: ["msi"], matches: false) == true,
+                     "the opt-in shows with evidence, and stays visible once chosen so it can be turned off")
+        suite.expect(choice(active: false) == nil && choice(ddc: false) == nil && choice(readable: true) == nil
+                     && choice(path: nil) == nil && choice(wanted: false) == nil
+                     && choice(readable: true, optedIn: ["msi"]) == nil,
+                     "readable, software-dimmed, inactive or pathless displays and a disabled speaker setting never offer it")
+
+        var level = Level(raw: 12)
+        suite.expect(level.standardStep == 6 && Level(raw: 0, maximum: 50).standardStep == 3
+                     && Level(raw: 0, maximum: 8).standardStep == 1,
+                     "a write-only key step is a sixteenth of the range, at least one unit")
+        level.step(direction: 1, fine: false)
+        let up = level.raw
+        level.step(direction: 1, fine: true)
+        let fineUp = level.raw
+        level.step(direction: -1, fine: false)
+        suite.expect(up == 18 && fineUp == 19 && level.raw == 13 && level.deviceValue == 13,
+                     "write-only keys step the stored raw level by 6, or by 1 for the fine step")
+        var low = Level(raw: 3)
+        low.step(direction: -1, fine: false)
+        var high = Level(raw: 98)
+        high.step(direction: 1, fine: false)
+        suite.expect(low.raw == 0 && high.raw == 100, "write-only steps stay between 0 and the maximum")
+
+        var muted = Level(raw: 40)
+        muted.toggleMute()
+        suite.expect(muted.muted && muted.deviceValue == 0 && muted.raw == 40,
+                     "a write-only mute writes level 0 and keeps the level to come back to")
+        var unmuted = muted
+        unmuted.toggleMute()
+        suite.expect(!unmuted.muted && unmuted.deviceValue == 40, "unmuting writes the level from before the mute")
+        var raised = muted
+        raised.step(direction: 1, fine: false)
+        var lowered = muted
+        lowered.step(direction: -1, fine: false)
+        suite.expect(!raised.muted && raised.deviceValue == 46 && !lowered.muted && lowered.deviceValue == 34,
+                     "a volume key while muted unmutes from the level before the mute, one step up or down")
+
+        var slider = muted
+        slider.set(volume: 0.5, raises: true)
+        var quiet = muted
+        quiet.set(volume: 0.2, raises: false)
+        var invalid = Level(raw: 40)
+        invalid.set(volume: .nan, raises: true)
+        suite.expect(slider.deviceValue == 50 && !slider.muted && quiet.muted && quiet.raw == 20 && invalid.raw == 40,
+                     "a slider set unmutes at its level, a lower keeps a mute, and a non-number changes nothing")
+
+        suite.expect(Level(stored: Level(raw: 33, muted: true).stored) == Level(raw: 33, muted: true)
+                     && Level(stored: ["raw": 500, "max": 100]) == Level(raw: 100)
+                     && Level(stored: ["raw": 5, "max": 0])?.maximum == 100
+                     && Level(stored: ["max": 100]) == nil && Level(stored: "12") == nil,
+                     "a stored write-only level reads back sanitized, and a malformed one reads as none")
+        let storedLevels: [String: Any] = ["msi": ["raw": 30], "gone": ["raw": 70]]
+        let kept = BrightnessSupport.updatedWriteOnlySpeakerLevels(storedLevels, path: "msi", level: Level(raw: 31),
+                                                                   optedInPaths: ["msi"])
+        suite.expect(Set(kept.keys) == ["msi"] && Level(stored: kept["msi"]) == Level(raw: 31)
+                     && BrightnessSupport.updatedWriteOnlySpeakerLevels(storedLevels, path: "msi", level: nil,
+                                                                        optedInPaths: ["msi"]).isEmpty
+                     && BrightnessSupport.updatedWriteOnlySpeakerLevels([:], path: "samsung", level: Level(raw: 9),
+                                                                        optedInPaths: ["msi"]).isEmpty,
+                     "stored write-only levels keep only opted-in paths")
+        suite.expect(BrightnessSupport.sendsWriteOnlyLevel(pathKey: "msi", readable: false, optedInPaths: ["msi"])
+                     && !BrightnessSupport.sendsWriteOnlyLevel(pathKey: "msi", readable: false, optedInPaths: [])
+                     && !BrightnessSupport.sendsWriteOnlyLevel(pathKey: "msi", readable: true, optedInPaths: ["msi"])
+                     && !BrightnessSupport.sendsWriteOnlyLevel(pathKey: nil, readable: false, optedInPaths: ["msi"]),
+                     "a queued write-only level is sent only while its path is still opted in and write-only")
+        var afterRead = Level.read(volume: 0.1, maximum: 100)
+        afterRead.step(direction: 1, fine: false)
+        var wideRead = Level.read(volume: 0.5, maximum: 200)
+        wideRead.step(direction: -1, fine: true)
+        suite.expect(afterRead.deviceValue == 16 && wideRead.raw == 99 && wideRead.maximum == 200
+                     && Level.read(volume: 0.1, maximum: 0) == Level(raw: 10),
+                     "a level read while the monitor answered replaces the stored one, so a return to write-only steps from it")
+        let merged = BrightnessSupport.mergedReadSpeakerLevels(
+            ["msi": ["raw": 80], "samsung": ["raw": 30], "gone": ["raw": 50]],
+            read: ["msi": Level(raw: 10), "optedOut": Level(raw: 70)], optedInPaths: ["msi", "samsung"])
+        suite.expect(Set(merged.keys) == ["msi", "samsung"] && Level(stored: merged["msi"]) == Level(raw: 10)
+                     && Level(stored: merged["samsung"]) == Level(raw: 30),
+                     "levels read during a scan are stored only for paths still opted in when it publishes")
+        suite.expect(BrightnessSupport.writeOnlySeedDisplays(paths: [3: "msi", 4: "samsung"], awaiting: ["msi"]) == [3]
+                     && BrightnessSupport.writeOnlySeedDisplays(paths: [3: "msi", 4: "samsung"],
+                                                                awaiting: ["samsung", "msi"]) == [3, 4]
+                     && BrightnessSupport.writeOnlySeedDisplays(paths: [4: "samsung"], awaiting: ["msi"]).isEmpty
+                     && BrightnessSupport.writeOnlySeedDisplays(paths: [:], awaiting: ["msi"]).isEmpty,
+                     "turning the opt-in on sends the starting level once the monitor's speaker route exists")
 
         func keyData(_ code: Int, state: Int, repeatBit: Int = 0) -> Int {
             (code << 16) | (state << 8) | repeatBit
@@ -175,5 +341,17 @@ enum DisplaySpeakerVolumeTests {
         suite.expect(SettingsBackupSupport.machineStateKeys.contains(DefaultsKey.displayAudioSilentPaths)
                      && !SettingsBackupSupport.exportKeys().contains(DefaultsKey.displayAudioSilentPaths),
                      "a monitor's silent-speaker memory stays on this Mac")
+        suite.expect([DefaultsKey.displayAudioBlindPaths, DefaultsKey.displayAudioLevels].allSatisfy {
+                         SettingsBackupSupport.machineStateKeys.contains($0) && !SettingsBackupSupport.exportKeys().contains($0)
+                     },
+                     "a monitor's write-only speaker opt-in and level stay on this Mac")
+        suite.expect(AppLanguage.allCases.allSatisfy {
+                         let strings = FeatureStrings.brightness($0)
+                         return !strings.writeOnlySpeakers.isEmpty && !strings.writeOnlySpeakersCaption.isEmpty
+                             && !strings.speakersLabel.isEmpty && !strings.noMonitorSpeakers.isEmpty
+                             && ($0 == .enUS || strings.speakersLabel != FeatureStrings.brightness(.enUS).speakersLabel)
+                             && ($0 == .enUS || strings.writeOnlySpeakers != FeatureStrings.brightness(.enUS).writeOnlySpeakers)
+                     },
+                     "the write-only speaker opt-in is translated in every language")
     }
 }

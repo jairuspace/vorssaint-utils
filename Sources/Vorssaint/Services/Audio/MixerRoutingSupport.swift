@@ -163,10 +163,15 @@ struct MixerRefreshCoordinator {
 }
 
 enum MixerRoutingSupport {
-    static func observationNeeds(isAvailable: (AppFeature) -> Bool)
+    /// What the shared CoreAudio observation has to run for. Device listeners
+    /// serve the mixer, priority, the output switcher and monitor speakers,
+    /// which follow the default output from the device list; per-app process
+    /// watching serves the mixer alone.
+    static func observationNeeds(isAvailable: (AppFeature) -> Bool, monitorSpeakers: Bool = false)
         -> (devices: Bool, processes: Bool) {
         let mixer = isAvailable(.mixer)
-        return (mixer || isAvailable(.audioPriority) || isAvailable(.soundOutputSwitcher), mixer)
+        return (mixer || isAvailable(.audioPriority) || isAvailable(.soundOutputSwitcher)
+                    || monitorSpeakers, mixer)
     }
 
     static let systemDefaultSelectionID = "__system_default__"

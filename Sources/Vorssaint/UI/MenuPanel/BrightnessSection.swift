@@ -146,6 +146,8 @@ struct BrightnessSection: View {
             SoftwareDimmingButton(display: display, compact: true)
             if display.isActive, let audio = display.audio {
                 volumeRow(display, audio: audio)
+            } else if service.writeOnlySpeakerChoices[display.id] != nil {
+                WriteOnlySpeakersOfferRow(display: display)
             }
         }
     }
@@ -216,6 +218,7 @@ struct BrightnessSection: View {
                 .font(.system(size: 10, weight: .semibold).monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 30, alignment: .trailing)
+            WriteOnlySpeakersSwitch(display: display, compact: true)
         }
     }
 }
@@ -344,5 +347,235 @@ func displayControlFailureText(_ failure: BrightnessService.DisplayControlFailur
     case .lastActive: return strings.lastDisplayCaption
     case .failed: return strings.switchFailed
     case .closedLid: return strings.openLidToEnable
+    }
+}
+
+/// The write-only speaker opt-in as a switch, for every surface that lists a
+/// monitor's speakers. It shows only for a write-only monitor offered the
+/// opt-in: with evidence the monitor carries the Mac's sound, and while it
+/// is on, so it can be turned off where it was turned on.
+struct WriteOnlySpeakersSwitch: View {
+    @ObservedObject private var l10n = L10n.shared
+    @ObservedObject private var service = BrightnessService.shared
+    let display: BrightnessDisplay
+    var compact = false
+
+    private var strings: BrightnessFeatureStrings { FeatureStrings.brightness(l10n.language) }
+
+    var body: some View {
+        if let chosen = service.writeOnlySpeakerChoices[display.id] {
+            Toggle(strings.writeOnlySpeakers, isOn: Binding(
+                get: { chosen },
+                set: { service.setWriteOnlySpeakersPreferred($0, for: display.id) }))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(compact ? .mini : .small)
+                .disabled(service.isDisplayPending(display.id))
+                .help(strings.writeOnlySpeakersCaption)
+                .accessibilityLabel("\(display.name): \(strings.writeOnlySpeakers)")
+        }
+    }
+}
+
+/// The panel's speaker line for a write-only monitor offered the opt-in while
+/// its speakers are not built yet: just the label and the switch, so the
+/// switch's meaning is plain. Once on, the monitor's normal speaker line
+/// takes over.
+struct WriteOnlySpeakersOfferRow: View {
+    @ObservedObject private var l10n = L10n.shared
+    let display: BrightnessDisplay
+
+    private var strings: BrightnessFeatureStrings { FeatureStrings.brightness(l10n.language) }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "speaker.wave.2.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            Text(strings.speakersLabel)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            WriteOnlySpeakersSwitch(display: display, compact: true)
+        }
+    }
+}
+
+/// The columns of the Settings speaker table: a name column as wide as the
+/// longest monitor name, the flexible slider, one percentage column and a
+/// trailing slot as wide as the widest row's controls, so every slider starts
+/// and ends at the same place. The name column gives way, truncating in the
+/// middle, only where it would leave the slider narrower than its minimum.
+struct DisplayRowColumns: Equatable {
+    static let iconWidth: CGFloat = 26
+    static let muteWidth: CGFloat = 20
+    static let percentWidth: CGFloat = 40
+    static let sliderMinWidth: CGFloat = 80
+    static let spacing: CGFloat = 10
+    var nameWidth: CGFloat = 120
+    var trailingWidth: CGFloat = 0
+
+    /// The name column for a row of `rowWidth`: the longest name, unless that
+    /// would squeeze the slider below its minimum next to `trailingWidth`.
+    static func nameColumnWidth(longestName: CGFloat, rowWidth: CGFloat,
+                                trailingWidth: CGFloat) -> CGFloat {
+        guard longestName > 0 else { return 120 }
+        guard rowWidth > 0 else { return longestName.rounded(.up) }
+        let fixed = iconWidth + muteWidth + percentWidth + sliderMinWidth + trailingWidth + spacing * 5
+        return max(60, min(longestName.rounded(.up), rowWidth - fixed))
+    }
+}
+
+/// The widest of one measured column among the speaker table's rows.
+private struct DisplayRowTrailingWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct DisplayRowNameWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct DisplayRowWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// The Settings speaker table: one aligned row per monitor whose speakers
+/// can be driven. It measures its own rows to size the shared columns.
+struct DisplaySpeakersTable: View {
+    let monitors: [BrightnessDisplay]
+    @State private var columns = DisplayRowColumns()
+    @State private var longestName: CGFloat = 0
+    @State private var rowWidth: CGFloat = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(monitors) { display in
+                DisplaySpeakersRow(display: display, columns: columns)
+            }
+        }
+        .background(GeometryReader { proxy in
+            Color.clear.preference(key: DisplayRowWidthKey.self, value: proxy.size.width)
+        })
+        .onPreferenceChange(DisplayRowTrailingWidthKey.self) { width in
+            if columns.trailingWidth != width {
+                columns.trailingWidth = width
+                fitNameColumn()
+            }
+        }
+        .onPreferenceChange(DisplayRowNameWidthKey.self) { width in
+            if longestName != width {
+                longestName = width
+                fitNameColumn()
+            }
+        }
+        .onPreferenceChange(DisplayRowWidthKey.self) { width in
+            if rowWidth != width {
+                rowWidth = width
+                fitNameColumn()
+            }
+        }
+    }
+
+    private func fitNameColumn() {
+        let width = DisplayRowColumns.nameColumnWidth(longestName: longestName, rowWidth: rowWidth,
+                                                      trailingWidth: columns.trailingWidth)
+        if columns.nameWidth != width { columns.nameWidth = width }
+    }
+}
+
+/// One row of the Settings speaker table, in the familiar volume order: the
+/// monitor's tile and name, the speaker button that mutes, the slider and the
+/// level, with a write-only monitor's opt-in switch alone at the end. While
+/// that switch is off the row shows nothing else, so its meaning is plain.
+struct DisplaySpeakersRow: View {
+    @ObservedObject private var l10n = L10n.shared
+    @ObservedObject private var service = BrightnessService.shared
+    let display: BrightnessDisplay
+    let columns: DisplayRowColumns
+
+    private var strings: BrightnessFeatureStrings { FeatureStrings.brightness(l10n.language) }
+    private var audio: BrightnessDisplay.Audio? { display.isActive ? display.audio : nil }
+
+    var body: some View {
+        HStack(spacing: DisplayRowColumns.spacing) {
+            Image(systemName: "display")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(display.isActive ? Color.accentColor : Color.secondary)
+                .frame(width: DisplayRowColumns.iconWidth, height: 26)
+                .background((display.isActive ? Color.accentColor : Color.secondary).opacity(0.12),
+                            in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            Text(display.name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(width: columns.nameWidth, alignment: .leading)
+                .background(alignment: .leading) {
+                    Text(display.name)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .hidden()
+                        .background(GeometryReader { proxy in
+                            Color.clear.preference(key: DisplayRowNameWidthKey.self, value: proxy.size.width)
+                        })
+                }
+                .help(display.name)
+            if let audio {
+                muteButton(audio)
+                Slider(value: Binding(get: { audio.volume },
+                                      set: { service.setVolume($0, for: display.id) }),
+                       in: 0...1)
+                    .accessibilityLabel("\(display.name) \(strings.volumeLabel)")
+                    .frame(minWidth: DisplayRowColumns.sliderMinWidth)
+                Text("\(Int((audio.volume * 100).rounded()))%")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(width: DisplayRowColumns.percentWidth, alignment: .trailing)
+            } else {
+                Spacer()
+            }
+            HStack(spacing: 0) {
+                WriteOnlySpeakersSwitch(display: display)
+            }
+            .fixedSize()
+            .background(GeometryReader { proxy in
+                Color.clear.preference(key: DisplayRowTrailingWidthKey.self, value: proxy.size.width)
+            })
+            .frame(minWidth: columns.trailingWidth, alignment: .trailing)
+        }
+    }
+
+    /// The speaker button that mutes, or a plain speaker symbol when the
+    /// monitor has no mute. Write-only speakers always offer it.
+    @ViewBuilder
+    private func muteButton(_ audio: BrightnessDisplay.Audio) -> some View {
+        if let muted = audio.muted {
+            Button {
+                service.setMuted(!muted, for: display.id)
+            } label: {
+                Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(muted ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+                    .frame(width: DisplayRowColumns.muteWidth, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(muted ? strings.unmute : strings.mute)
+            .accessibilityLabel(muted ? strings.unmute : strings.mute)
+        } else {
+            Image(systemName: "speaker.wave.2.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: DisplayRowColumns.muteWidth, height: 18)
+        }
     }
 }

@@ -29,6 +29,10 @@ struct BrightnessDisplay: Identifiable, Equatable {
         var volume: Double
         /// Nil when the monitor carries sound but offers no mute control.
         var muted: Bool?
+        /// Set for a monitor whose channel never answers a read and whose
+        /// speakers the person opted in to: the level is the one last sent,
+        /// kept on this Mac, rather than one read from the monitor.
+        var writeOnly: BrightnessSupport.WriteOnlySpeakerLevel? = nil
     }
 
     let id: CGDirectDisplayID
@@ -51,6 +55,14 @@ struct BrightnessDisplay: Identifiable, Equatable {
     var restorationFingerprint: String? = nil
     /// The monitor's speakers, once its channel has been asked about them.
     var audio: Audio? = nil
+}
+
+extension BrightnessDisplay.Audio {
+    /// The published speakers of a write-only monitor, shown at the level
+    /// last sent. Write-only speakers always offer mute, which writes 0.
+    init(writeOnly level: BrightnessSupport.WriteOnlySpeakerLevel) {
+        self.init(volume: level.volume, muted: level.muted, writeOnly: level)
+    }
 }
 
 /// Brightness sliders for every display, built-in and external. The built-in
@@ -101,6 +113,14 @@ final class BrightnessService: ObservableObject {
     /// the panel (issue #1589).
     @Published private(set) var softwareDimmingPreferred = Set<CGDirectDisplayID>()
     @Published private(set) var extendedDimmingPreferred = Set<CGDirectDisplayID>()
+    /// Displays offered the write-only speaker opt-in, with whether it is on.
+    /// A display is missing while there is no evidence its speakers carry
+    /// the Mac's sound and it was never chosen.
+    @Published private(set) var writeOnlySpeakerChoices: [CGDirectDisplayID: Bool] = [:]
+    /// Paths just opted in whose starting level has not been sent yet. The
+    /// speakers only exist once the scan the opt-in starts has published
+    /// them, so the level goes out then. Main thread only.
+    private var writeOnlySeedPaths = Set<String>()
     @Published private(set) var displayControlFailure: DisplayControlFailure?
     @Published private(set) var brightnessOSDSupported = false
     @Published private(set) var keyboardLightEnabled: Bool?
@@ -220,6 +240,9 @@ final class BrightnessService: ObservableObject {
     private struct PendingAudio {
         var volume: Double?
         var muted: Bool?
+        /// A level for write-only speakers, in the monitor's own units and
+        /// already including a mute. It replaces any queued volume or mute.
+        var writeOnlyRaw: UInt16?
     }
     private var pendingAudio: [CGDirectDisplayID: PendingAudio] = [:]
     /// Whether the last completed scan asked the monitors about their
@@ -254,6 +277,14 @@ final class BrightnessService: ObservableObject {
     /// and after every scan.
     private var audioKeyTarget: (id: CGDirectDisplayID, supportsMute: Bool)?
     private var audioOutputListener: AudioObjectPropertyListenerBlock?
+    /// Whether the mixer was last told that monitor speakers need its output
+    /// device list, so a preference sync asks it again only on a change.
+    /// Main thread only.
+    private var mixerObservesAudioOutputs = false
+    /// Set when the default output changed and the key target was cleared:
+    /// the next device list the mixer reads restores it, even when that list
+    /// looks the same as the one before. Main thread only.
+    private var awaitsAudioOutputs = false
     private var writeSequence: UInt64 = 0
     /// Keeps fast system-key repeats based on the newest requested value while
     /// DisplayServices is still applying the previous asynchronous write.
@@ -556,6 +587,11 @@ final class BrightnessService: ObservableObject {
         // Knowing which monitor carries the sound is only worth a CoreAudio
         // observer while its speakers are on: the level shown and the keys follow it.
         if running, wantsMonitorVolume { installAudioOutputObserver() } else { removeAudioOutputObserver() }
+        let observesOutputs = Self.observesAudioOutputs
+        if observesOutputs != mixerObservesAudioOutputs {
+            mixerObservesAudioOutputs = observesOutputs
+            AppVolumeMixer.shared.syncWithPreferences()
+        }
         refreshAudioKeyTarget()
         syncKeyTap()
         syncKeyboardBrightnessHotkeys()
@@ -2177,6 +2213,7 @@ final class BrightnessService: ObservableObject {
         var extendedDimmingIDs = Set<CGDirectDisplayID>()
         var softwarePathKeys: [CGDirectDisplayID: String] = [:]
         var retryDelay: TimeInterval?
+        var readSpeakerLevels: [String: BrightnessSupport.WriteOnlySpeakerLevel] = [:]
         if !ddcCandidates.isEmpty, BrightnessBridge.ddcAvailable {
             let services = Self.externalServices()
             var scores: [(displayIndex: Int, serviceOrdinal: Int, score: Int)] = []
@@ -2241,6 +2278,15 @@ final class BrightnessService: ObservableObject {
                     let audio = probesAudio
                         ? probeAudio(for: id, service: matched.service, pathKey: pathKey)
                         : nil
+                    // A monitor opted in while it was write-only can answer
+                    // again. Keep the level it reports, so falling back to
+                    // write-only later steps from it instead of a stale one.
+                    // Stored on main when the scan publishes, where every
+                    // other change to the stored levels happens.
+                    if let audio, let pathKey {
+                        readSpeakerLevels[pathKey] = .read(volume: audio.state.volume,
+                                                           maximum: audio.route.maximum)
+                    }
                     let ceiling = BrightnessSupport.sanitizedMaximum(maximum)
                     let hardware = BrightnessSupport.normalized(current: current, maximum: ceiling)
                     let wantsExtendedDimming = pathKey.map {
@@ -2303,12 +2349,26 @@ final class BrightnessService: ObservableObject {
                         ? BrightnessSupport.extendedDimmingComponents(for: remembered).hardware
                         : remembered
                     stateLock.unlock()
+                    // Speakers on a channel that never answers are only built
+                    // for a path the person opted in to, at the level last
+                    // sent. Mute is never probed here: it is a write of 0.
+                    let writeOnlySpeakers = BrightnessSupport.writeOnlySpeakerLevel(
+                        probesAudio: probesAudio, pathKey: pathKey,
+                        optedInPaths: rememberedPaths(DefaultsKey.displayAudioBlindPaths),
+                        storedLevels: UserDefaults.standard.dictionary(forKey: DefaultsKey.displayAudioLevels))
+                    if let writeOnlySpeakers {
+                        Self.log.log("ddc audio write-only display \(id): level \(writeOnlySpeakers.raw) of \(writeOnlySpeakers.maximum) muted \(writeOnlySpeakers.muted)")
+                    }
                     built[candidate.index] = BrightnessDisplay(
                         id: id, name: built[candidate.index].name, isBuiltIn: false,
                         method: .ddc, isActive: true, brightness: seed,
-                        readable: false, canChooseDimming: pathKey != nil)
+                        readable: false, canChooseDimming: pathKey != nil,
+                        audio: writeOnlySpeakers.map(BrightnessDisplay.Audio.init(writeOnly:)))
                     newRoutes[id] = Route(method: .ddc, service: matched.service,
-                                          maximum: 100, ddcPathKey: pathKey)
+                                          maximum: 100, ddcPathKey: pathKey,
+                                          audio: writeOnlySpeakers.map {
+                                              AudioRoute(maximum: UInt16($0.maximum), supportsMute: false)
+                                          })
                     softwareIndices.remove(candidate.index)
                 case .dead:
                     forgetWriteOnlyDDCPath(pathKey)
@@ -2424,9 +2484,17 @@ final class BrightnessService: ObservableObject {
             let route = display.method.map { String(describing: $0) } ?? "none"
             Self.log.log("display \(display.id) [\(Self.displayFingerprint(display.id), privacy: .public)] route \(route, privacy: .public) level \(display.brightness)")
         }
+        // The scan read the stored write-only levels on this queue; a key
+        // pressed since then stored a newer one, which main reads again.
+        let writeOnlySpeakerPaths = newRoutes.compactMapValues { route -> String? in
+            route.audio != nil && !route.ddcReadable ? route.ddcPathKey : nil
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self, self.running, generation == self.rebuildGeneration else { return }
+            self.storeReadSpeakerLevels(readSpeakerLevels)
+            let resolved = self.withCurrentWriteOnlyLevels(resolved, paths: writeOnlySpeakerPaths)
             if self.displays != resolved { self.displays = resolved }
+            self.seedWriteOnlySpeakers(paths: writeOnlySpeakerPaths)
             if self.softwareDimmingPreferred != forcedSoftwareIDs {
                 self.softwareDimmingPreferred = forcedSoftwareIDs
             }
@@ -2526,6 +2594,19 @@ final class BrightnessService: ObservableObject {
                                    route: Route?) {
         guard let route, route.method == .ddc,
               let service = route.service, let audio = route.audio else { return }
+        if let raw = pending.writeOnlyRaw {
+            // Checked again here, after the queue: the person may have turned
+            // the speakers off, or the monitor may answer reads now.
+            guard BrightnessSupport.sendsWriteOnlyLevel(
+                pathKey: route.ddcPathKey, readable: route.ddcReadable,
+                optedInPaths: rememberedPaths(DefaultsKey.displayAudioBlindPaths)) else { return }
+            let written = ddcSend(to: id, service: service,
+                                  packet: BrightnessSupport.writePacket(
+                                      code: BrightnessSupport.audioVolumeCode,
+                                      value: min(raw, audio.maximum)))
+            Self.log.log("wrote display \(id) write-only volume \(raw) ok \(written)")
+            return
+        }
         let muted = audio.supportsMute ? pending.muted : nil
         func writeMute(_ muted: Bool) {
             let written = ddcSend(to: id, service: service,
@@ -2877,6 +2958,7 @@ final class BrightnessService: ObservableObject {
     /// the monitor's volume was still zero, and the monitor ignores that.
     func setVolume(_ value: Double, for id: CGDirectDisplayID, raises: Bool = true) {
         let clamped = min(max(value, 0), 1)
+        if updateWriteOnlySpeakers(id, { $0.set(volume: clamped, raises: raises) }) { return }
         let mute = displays.first(where: { $0.id == id })?.audio.flatMap {
             BrightnessSupport.monitorMuteChange(from: $0.volume, muted: $0.muted,
                                                 to: clamped, raises: raises)
@@ -2887,19 +2969,185 @@ final class BrightnessService: ObservableObject {
     /// Mutes or unmutes a monitor that offers the control. Monitors without
     /// one keep their volume slider and never show a mute button.
     func setMuted(_ muted: Bool, for id: CGDirectDisplayID) {
+        if updateWriteOnlySpeakers(id, { $0.setMuted(muted) }) { return }
         setSpeakers(volume: nil, muted: muted, for: id)
     }
 
     private func setSpeakers(volume: Double?, muted: Bool?, for id: CGDirectDisplayID) {
+        if let volume { rememberReadableSpeakerLevel(volume, for: id) }
         if let index = displays.firstIndex(where: { $0.id == id }), var audio = displays[index].audio {
             if let volume { audio.volume = volume }
             if let muted, audio.muted != nil { audio.muted = muted }
             if displays[index].audio != audio { displays[index].audio = audio }
         }
         queueAudio(for: id) { pending in
+            pending.writeOnlyRaw = nil
             if let volume { pending.volume = volume }
             if let muted { pending.muted = muted }
         }
+    }
+
+    /// Keeps the stored level of an opted-in monitor current while it answers
+    /// reads, so a return to write-only starts from what the slider set.
+    private func rememberReadableSpeakerLevel(_ volume: Double, for id: CGDirectDisplayID) {
+        stateLock.lock()
+        let route = routes[id]
+        stateLock.unlock()
+        guard let route, route.ddcReadable, let maximum = route.audio?.maximum,
+              let pathKey = route.ddcPathKey,
+              rememberedPaths(DefaultsKey.displayAudioBlindPaths).contains(pathKey) else { return }
+        storeWriteOnlyLevel(.read(volume: volume, maximum: maximum), for: pathKey)
+    }
+
+    /// Applies a volume or mute key to write-only speakers, stepping the level
+    /// last sent in the monitor's own units. False for any other display, so
+    /// the caller keeps the normal path for monitors that answer reads.
+    /// Main thread only.
+    func applyWriteOnlySpeakerKey(_ action: BrightnessSupport.VolumeKeyAction, fine: Bool,
+                                  for id: CGDirectDisplayID) -> Bool {
+        updateWriteOnlySpeakers(id) { level in
+            switch action {
+            case let .step(direction): level.step(direction: direction, fine: fine)
+            case .toggleMute: level.toggleMute()
+            }
+        }
+    }
+
+    /// The one way a write-only level changes: the published value updates at
+    /// once, the level is stored, since nothing can be read back, and the
+    /// write is queued on the shared DDC queue. False when the display has no
+    /// write-only speakers or its route no longer is one.
+    private func updateWriteOnlySpeakers(_ id: CGDirectDisplayID,
+                                         _ change: (inout BrightnessSupport.WriteOnlySpeakerLevel) -> Void) -> Bool {
+        guard let index = displays.firstIndex(where: { $0.id == id }), displays[index].isActive,
+              var level = displays[index].audio?.writeOnly else { return false }
+        stateLock.lock()
+        let route = routes[id]
+        stateLock.unlock()
+        guard let route, route.method == .ddc, !route.ddcReadable, route.audio != nil,
+              let pathKey = route.ddcPathKey else { return false }
+        change(&level)
+        let audio = BrightnessDisplay.Audio(writeOnly: level)
+        if displays[index].audio != audio { displays[index].audio = audio }
+        storeWriteOnlyLevel(level, for: pathKey)
+        queueAudio(for: id) { pending in
+            pending.volume = nil
+            pending.muted = nil
+            pending.writeOnlyRaw = level.deviceValue
+        }
+        return true
+    }
+
+    /// Stores, or with nil forgets, the level sent to one path. Only opted-in
+    /// paths are kept, which bounds the dictionary with the path list.
+    private func storeWriteOnlyLevel(_ level: BrightnessSupport.WriteOnlySpeakerLevel?, for pathKey: String) {
+        let defaults = UserDefaults.standard
+        let stored = defaults.dictionary(forKey: DefaultsKey.displayAudioLevels) ?? [:]
+        let updated = BrightnessSupport.updatedWriteOnlySpeakerLevels(
+            stored, path: pathKey, level: level,
+            optedInPaths: rememberedPaths(DefaultsKey.displayAudioBlindPaths))
+        if updated.isEmpty {
+            if !stored.isEmpty { defaults.removeObject(forKey: DefaultsKey.displayAudioLevels) }
+        } else {
+            defaults.set(updated, forKey: DefaultsKey.displayAudioLevels)
+        }
+    }
+
+    /// Stores the levels a scan read from opted-in monitors that answered,
+    /// against the opt-in list as it is now, so a path turned off while the
+    /// scan ran is not brought back. Main thread only, like every other
+    /// change to the stored levels.
+    private func storeReadSpeakerLevels(_ levels: [String: BrightnessSupport.WriteOnlySpeakerLevel]) {
+        guard !levels.isEmpty else { return }
+        let defaults = UserDefaults.standard
+        let stored = defaults.dictionary(forKey: DefaultsKey.displayAudioLevels) ?? [:]
+        let updated = BrightnessSupport.mergedReadSpeakerLevels(
+            stored, read: levels, optedInPaths: rememberedPaths(DefaultsKey.displayAudioBlindPaths))
+        if updated.isEmpty {
+            if !stored.isEmpty { defaults.removeObject(forKey: DefaultsKey.displayAudioLevels) }
+        } else {
+            defaults.set(updated, forKey: DefaultsKey.displayAudioLevels)
+        }
+    }
+
+    /// The scan's displays with each write-only level as stored now, so a key
+    /// pressed while the scan ran is not undone when it publishes.
+    private func withCurrentWriteOnlyLevels(_ resolved: [BrightnessDisplay],
+                                            paths: [CGDirectDisplayID: String]) -> [BrightnessDisplay] {
+        guard !paths.isEmpty else { return resolved }
+        let stored = UserDefaults.standard.dictionary(forKey: DefaultsKey.displayAudioLevels)
+        return resolved.map { display in
+            guard display.audio?.writeOnly != nil, let path = paths[display.id],
+                  let level = BrightnessSupport.WriteOnlySpeakerLevel(stored: stored?[path]) else { return display }
+            var current = display
+            current.audio = BrightnessDisplay.Audio(writeOnly: level)
+            return current
+        }
+    }
+
+    /// Turns the speakers of a write-only monitor on or off for its
+    /// connection path. On, a scan builds them and their starting level is
+    /// sent as soon as they exist. Off takes effect at once: the speakers,
+    /// their route and any queued write are dropped before the scan lands,
+    /// so nothing more is sent to the monitor.
+    func setWriteOnlySpeakersPreferred(_ preferred: Bool, for id: CGDirectDisplayID) {
+        stateLock.lock()
+        let pathKey = routes[id]?.ddcPathKey
+        stateLock.unlock()
+        guard let pathKey else { return }
+        rememberPath(pathKey, key: DefaultsKey.displayAudioBlindPaths, remembered: preferred)
+        if preferred {
+            writeOnlySeedPaths.insert(pathKey)
+        } else {
+            writeOnlySeedPaths.remove(pathKey)
+            storeWriteOnlyLevel(nil, for: pathKey)
+            stateLock.lock()
+            if routes[id]?.ddcReadable == false { routes[id]?.audio = nil }
+            pendingAudio[id] = nil
+            stateLock.unlock()
+            if let index = displays.firstIndex(where: { $0.id == id }), displays[index].audio?.writeOnly != nil {
+                displays[index].audio = nil
+            }
+        }
+        Self.log.log("display \(id) write-only speakers preferred \(preferred)")
+        refreshWriteOnlySpeakerChoices()
+        refresh(force: true)
+    }
+
+    /// Sends the starting level of speakers just opted in, once the scan has
+    /// published them. The monitor cannot report its level, so without this
+    /// the level shown would only be true after the first key. Main thread only.
+    private func seedWriteOnlySpeakers(paths: [CGDirectDisplayID: String]) {
+        for id in BrightnessSupport.writeOnlySeedDisplays(paths: paths, awaiting: writeOnlySeedPaths) {
+            guard let path = paths[id] else { continue }
+            writeOnlySeedPaths.remove(path)
+            if updateWriteOnlySpeakers(id, { _ in }) {
+                Self.log.log("display \(id) write-only speakers seeded")
+            }
+        }
+    }
+
+    /// Works out which displays offer the write-only opt-in. Main thread only:
+    /// it reads the published displays and the mixer's device list.
+    private func refreshWriteOnlySpeakerChoices() {
+        var choices: [CGDirectDisplayID: Bool] = [:]
+        if running, wantsMonitorVolume {
+            let optedIn = rememberedPaths(DefaultsKey.displayAudioBlindPaths)
+            let outputs = Self.audioOutputs()
+            let candidates = audioCandidates()
+            stateLock.lock()
+            let pathKeys = routes.mapValues(\.ddcPathKey)
+            stateLock.unlock()
+            for display in displays where !display.isBuiltIn {
+                let choice = BrightnessSupport.writeOnlySpeakerChoice(
+                    isActive: display.isActive, isDDC: display.method == .ddc, readable: display.readable,
+                    pathKey: pathKeys[display.id] ?? nil, speakersWanted: true, optedInPaths: optedIn,
+                    outputMatches: BrightnessSupport.offersWriteOnlySpeakers(
+                        displayID: display.id, outputs: outputs, displays: candidates))
+                if let choice { choices[display.id] = choice }
+            }
+        }
+        if writeOnlySpeakerChoices != choices { writeOnlySpeakerChoices = choices }
     }
 
     /// Tap-side answer for a volume key: whether the press belongs to the
@@ -2919,14 +3167,14 @@ final class BrightnessService: ObservableObject {
     /// displays are scanned again, remembered write-only paths included. The
     /// press itself stays with macOS. Main thread only.
     func rescanForUnclaimedVolumeKey() {
-        guard wantsMonitorVolumeKeys, let output = Self.defaultOutputDevice() else { return }
+        guard wantsMonitorVolumeKeys, let output = Self.defaultAudioOutput() else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let hasTarget = keyThreadLock.withLock { audioKeyTarget != nil }
         guard BrightnessSupport.rescansForVolumeKey(
             hasTarget: hasTarget,
             displayOwnsOutput: BrightnessSupport.displayOwnsOutputVolume(
                 transport: output.transport,
-                outputHasSettableVolume: AppVolumeMixer.hasSettableOutputVolume(for: output.id)),
+                outputHasSettableVolume: output.hasSettableVolume),
             now: now, lastRescan: lastVolumeKeyRescan) else { return }
         lastVolumeKeyRescan = now
         Self.log.log("volume key without target; rescanning")
@@ -2938,19 +3186,9 @@ final class BrightnessService: ObservableObject {
     /// macOS cannot set that output's volume. Main thread only: it reads the
     /// published display list. Nil for every other output.
     func monitorSpeakerOutput() -> BrightnessSupport.MonitorSpeakerOutput? {
-        guard running, wantsMonitorVolume, let output = Self.defaultOutputDevice(),
-              BrightnessSupport.displayOwnsOutputVolume(
-                  transport: output.transport,
-                  outputHasSettableVolume: AppVolumeMixer.hasSettableOutputVolume(for: output.id))
-        else { return nil }
-        let candidates = displays.compactMap { display -> (id: UInt32, name: String)? in
-            guard display.isActive, display.audio != nil else { return nil }
-            return (display.id, display.name)
-        }
-        guard let id = BrightnessSupport.displayForAudioOutput(
-            deviceName: output.name, candidates: candidates,
-            connectedDisplayCount: displays.filter(\.isActive).count),
-              let audio = displays.first(where: { $0.id == id })?.audio
+        guard running, wantsMonitorVolume, let output = Self.defaultAudioOutput(),
+              let id = BrightnessSupport.displayForAudioOutput(output, displays: audioCandidates()),
+              let audio = displays.first(where: { $0.id == id && $0.isActive })?.audio
         else { return nil }
         return BrightnessSupport.MonitorSpeakerOutput(
             displayID: id, volume: audio.volume, muted: audio.muted)
@@ -3004,7 +3242,7 @@ final class BrightnessService: ObservableObject {
     private func installAudioOutputObserver() {
         guard audioOutputListener == nil else { return }
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.refreshAudioKeyTarget()
+            self?.defaultAudioOutputChanged()
         }
         var address = Self.defaultOutputAddress
         guard AudioObjectAddPropertyListenerBlock(
@@ -3042,32 +3280,67 @@ final class BrightnessService: ObservableObject {
             Self.log.log("volume keys now reach display \(shown, privacy: .public)")
         }
         AppVolumeMixer.shared.refreshMonitorOutput()
+        refreshWriteOnlySpeakerChoices()
     }
 
-    /// The device the Mac plays through, with its name and how it is wired.
-    /// A device with no readable name keeps an empty one, which the match
-    /// then has to answer by the monitor count alone.
-    private static func defaultOutputDevice() -> (id: AudioObjectID,
-                                                  name: String,
-                                                  transport: UInt32)? {
-        guard let deviceID = AppVolumeMixer.defaultOutputDeviceID() else { return nil }
-        var transport: UInt32 = 0
-        var size = UInt32(MemoryLayout<UInt32>.size)
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyTransportType,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr else {
-            return nil
+    /// Whether monitor speakers need the mixer's output device list. A plain
+    /// defaults read, so the mixer can ask it while it syncs, before or after
+    /// this service has started.
+    static var observesAudioOutputs: Bool {
+        let defaults = UserDefaults.standard
+        return AppFeature.brightness.isAvailable
+            && defaults.bool(forKey: DefaultsKey.brightnessControlEnabled)
+            && defaults.bool(forKey: DefaultsKey.displayVolumeEnabled)
+    }
+
+    /// Called by the mixer after each refresh of its output devices, on main.
+    /// The key target is worked out again only when the default output or
+    /// the list changed, or a default output change is still waiting for it.
+    func audioOutputsRefreshed(changed: Bool) {
+        guard changed || awaitsAudioOutputs else { return }
+        awaitsAudioOutputs = false
+        guard running else { return }
+        refreshAudioKeyTarget()
+    }
+
+    /// The default output changed before the mixer has read the new device
+    /// list. Until it has, nothing is known about the new output, so the keys
+    /// go back to macOS instead of reaching a monitor that may no longer
+    /// carry the sound, and a fresh read is requested.
+    private func defaultAudioOutputChanged() {
+        let cleared = keyThreadLock.withLock { () -> Bool in
+            let had = audioKeyTarget != nil
+            audioKeyTarget = nil
+            return had
         }
-        // CoreAudio hands the name over already retained, so it is taken as
-        // such rather than read into a bridged CFString and leaked.
-        var name: Unmanaged<CFString>?
-        size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-        address.mSelector = kAudioObjectPropertyName
-        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &name) == noErr,
-              let name else { return (deviceID, "", transport) }
-        return (deviceID, name.takeRetainedValue() as String, transport)
+        if cleared { Self.log.log("volume keys now reach display none") }
+        awaitsAudioOutputs = true
+        AppVolumeMixer.shared.refreshApps()
+    }
+
+    /// The output devices as the mixer last read them on its HAL queue, so
+    /// matching a monitor never reads CoreAudio on the main thread.
+    private static func audioOutputs() -> [BrightnessSupport.AudioOutputDevice] {
+        AppVolumeMixer.shared.outputDevices.map {
+            BrightnessSupport.AudioOutputDevice(uid: $0.uid, name: $0.name, transport: $0.transportType,
+                                                hasSettableVolume: $0.hasSettableVolume,
+                                                isDefault: $0.isDefault)
+        }
+    }
+
+    private static func defaultAudioOutput() -> BrightnessSupport.AudioOutputDevice? {
+        audioOutputs().first(where: \.isDefault)
+    }
+
+    /// Every active display with the EDID vendor and model its audio output
+    /// would carry. All of them take part, not only those with speakers, so
+    /// a twin without speakers still makes a match ambiguous.
+    private func audioCandidates() -> [BrightnessSupport.DisplayAudioCandidate] {
+        displays.filter(\.isActive).map {
+            BrightnessSupport.DisplayAudioCandidate(id: $0.id, name: $0.name,
+                                                    vendor: CGDisplayVendorNumber($0.id),
+                                                    model: CGDisplayModelNumber($0.id))
+        }
     }
 
     // MARK: - Speaker probing (work queue)

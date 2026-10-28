@@ -233,6 +233,16 @@ enum DefaultsKey {
     // write-only paths: two extra reads on a bus paced in tens of
     // milliseconds are not worth repeating on every scan.
     static let displayAudioSilentPaths = "displayAudioSilentPaths"
+    // Per-monitor connection paths whose write-only channel the person chose
+    // to drive the speakers of. Such a monitor never reports its level, so
+    // the choice belongs to one physical monitor on one Mac port.
+    static let displayAudioBlindPaths = "displayAudioBlindPaths"
+    // The speaker level of each of those paths, keyed by path: `raw`, `max`
+    // and `muted`. While the monitor is write-only it is the level last sent
+    // and the only record of what the monitor is set to, so keys step from
+    // it; while the monitor answers reads it follows the level read and set
+    // then, so a return to write-only does not jump.
+    static let displayAudioLevels = "displayAudioLevels"
     // Set once the paths cached before paired discovery requests have been
     // dropped, so a monitor written off then is classified again exactly once.
     static let brightnessDDCWriteOnlyPathsRechecked = "brightnessDDCWriteOnlyPathsRechecked"
