@@ -851,24 +851,72 @@ enum BrightnessSupport {
         muted == false && (volume ?? 0) > 0
     }
 
-    /// Which monitor the sound is coming out of. A single display is the whole
-    /// answer while it is the only one connected; otherwise the audio device's
-    /// name is matched against the display names, since macOS builds both from
-    /// the same EDID product name.
-    static func displayForAudioOutput(deviceName: String,
-                                      candidates: [(id: UInt32, name: String)],
-                                      connectedDisplayCount: Int) -> UInt32? {
-        guard !candidates.isEmpty else { return nil }
-        if candidates.count == 1, connectedDisplayCount <= 1 { return candidates[0].id }
-        let device = deviceName.lowercased()
-        guard !device.isEmpty else { return nil }
-        if let exact = candidates.first(where: { $0.name.lowercased() == device }) {
-            return exact.id
+    /// An output device as the mixer's HAL queue read it, with what matching
+    /// a monitor needs to know about it.
+    struct AudioOutputDevice: Equatable {
+        let uid: String
+        let name: String
+        let transport: UInt32
+        let hasSettableVolume: Bool
+        let isDefault: Bool
+    }
+
+    /// An active display that an output could belong to, with the vendor and
+    /// model numbers macOS reads from its EDID.
+    struct DisplayAudioCandidate: Equatable {
+        let id: UInt32
+        let name: String
+        let vendor: UInt32
+        let model: UInt32
+    }
+
+    /// The EDID identity at the start of a display output's UID: macOS builds
+    /// it from the EDID bytes, so the first four hex digits are the vendor in
+    /// EDID order and the next four the product code, low byte first
+    /// ("3669D23D-..." is vendor 0x3669, product 0x3DD2). Nil for any UID that
+    /// does not start that way, and for a zero vendor, which no EDID carries.
+    static func displayAudioIdentity(uid: String) -> (vendor: UInt32, model: UInt32)? {
+        let characters = Array(uid.utf8)
+        guard characters.count >= 8, characters.count == 8 || characters[8] == UInt8(ascii: "-") else {
+            return nil
         }
-        return candidates.first { candidate in
-            let name = candidate.name.lowercased()
-            return !name.isEmpty && (device.contains(name) || name.contains(device))
-        }?.id
+        func byte(_ offset: Int) -> UInt32? {
+            guard let text = String(bytes: characters[offset..<(offset + 2)], encoding: .ascii),
+                  text.allSatisfy(\.isHexDigit) else { return nil }
+            return UInt32(text, radix: 16)
+        }
+        guard let vendorHigh = byte(0), let vendorLow = byte(2),
+              let modelLow = byte(4), let modelHigh = byte(6) else { return nil }
+        let vendor = vendorHigh << 8 | vendorLow
+        guard vendor != 0 else { return nil }
+        return (vendor, modelHigh << 8 | modelLow)
+    }
+
+    /// Which monitor the sound is coming out of, or nil to leave the keys with
+    /// macOS. Only an output on a display cable whose volume macOS cannot set
+    /// belongs to a monitor. Its UID's EDID identity picks the display; two of
+    /// the same model are told apart by the exact name, and are otherwise
+    /// ambiguous. Without such a UID a lone display is the answer, or else a
+    /// unique exact name, ignoring case. Partial names never match: "LG"
+    /// would otherwise reach an "LG HDR 4K" on the same desk.
+    static func displayForAudioOutput(_ output: AudioOutputDevice,
+                                      displays: [DisplayAudioCandidate]) -> UInt32? {
+        guard displayOwnsOutputVolume(transport: output.transport,
+                                      outputHasSettableVolume: output.hasSettableVolume),
+              !displays.isEmpty else { return nil }
+        func uniqueName(in candidates: [DisplayAudioCandidate]) -> UInt32? {
+            let device = output.name.lowercased()
+            guard !device.isEmpty else { return nil }
+            let named = candidates.filter { $0.name.lowercased() == device }
+            return named.count == 1 ? named[0].id : nil
+        }
+        guard let identity = displayAudioIdentity(uid: output.uid) else {
+            if displays.count == 1 { return displays[0].id }
+            return uniqueName(in: displays)
+        }
+        let matches = displays.filter { $0.vendor == identity.vendor && $0.model == identity.model }
+        if matches.count == 1 { return matches[0].id }
+        return matches.isEmpty ? nil : uniqueName(in: matches)
     }
 
     /// An optional lower quarter of the slider dims the picture after the

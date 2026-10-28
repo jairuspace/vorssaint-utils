@@ -254,6 +254,14 @@ final class BrightnessService: ObservableObject {
     /// and after every scan.
     private var audioKeyTarget: (id: CGDirectDisplayID, supportsMute: Bool)?
     private var audioOutputListener: AudioObjectPropertyListenerBlock?
+    /// Whether the mixer was last told that monitor speakers need its output
+    /// device list, so a preference sync asks it again only on a change.
+    /// Main thread only.
+    private var mixerObservesAudioOutputs = false
+    /// Set when the default output changed and the key target was cleared:
+    /// the next device list the mixer reads restores it, even when that list
+    /// looks the same as the one before. Main thread only.
+    private var awaitsAudioOutputs = false
     private var writeSequence: UInt64 = 0
     /// Keeps fast system-key repeats based on the newest requested value while
     /// DisplayServices is still applying the previous asynchronous write.
@@ -556,6 +564,11 @@ final class BrightnessService: ObservableObject {
         // Knowing which monitor carries the sound is only worth a CoreAudio
         // observer while its speakers are on: the level shown and the keys follow it.
         if running, wantsMonitorVolume { installAudioOutputObserver() } else { removeAudioOutputObserver() }
+        let observesOutputs = Self.observesAudioOutputs
+        if observesOutputs != mixerObservesAudioOutputs {
+            mixerObservesAudioOutputs = observesOutputs
+            AppVolumeMixer.shared.syncWithPreferences()
+        }
         refreshAudioKeyTarget()
         syncKeyTap()
         syncKeyboardBrightnessHotkeys()
@@ -2919,14 +2932,14 @@ final class BrightnessService: ObservableObject {
     /// displays are scanned again, remembered write-only paths included. The
     /// press itself stays with macOS. Main thread only.
     func rescanForUnclaimedVolumeKey() {
-        guard wantsMonitorVolumeKeys, let output = Self.defaultOutputDevice() else { return }
+        guard wantsMonitorVolumeKeys, let output = Self.defaultAudioOutput() else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let hasTarget = keyThreadLock.withLock { audioKeyTarget != nil }
         guard BrightnessSupport.rescansForVolumeKey(
             hasTarget: hasTarget,
             displayOwnsOutput: BrightnessSupport.displayOwnsOutputVolume(
                 transport: output.transport,
-                outputHasSettableVolume: AppVolumeMixer.hasSettableOutputVolume(for: output.id)),
+                outputHasSettableVolume: output.hasSettableVolume),
             now: now, lastRescan: lastVolumeKeyRescan) else { return }
         lastVolumeKeyRescan = now
         Self.log.log("volume key without target; rescanning")
@@ -2938,19 +2951,9 @@ final class BrightnessService: ObservableObject {
     /// macOS cannot set that output's volume. Main thread only: it reads the
     /// published display list. Nil for every other output.
     func monitorSpeakerOutput() -> BrightnessSupport.MonitorSpeakerOutput? {
-        guard running, wantsMonitorVolume, let output = Self.defaultOutputDevice(),
-              BrightnessSupport.displayOwnsOutputVolume(
-                  transport: output.transport,
-                  outputHasSettableVolume: AppVolumeMixer.hasSettableOutputVolume(for: output.id))
-        else { return nil }
-        let candidates = displays.compactMap { display -> (id: UInt32, name: String)? in
-            guard display.isActive, display.audio != nil else { return nil }
-            return (display.id, display.name)
-        }
-        guard let id = BrightnessSupport.displayForAudioOutput(
-            deviceName: output.name, candidates: candidates,
-            connectedDisplayCount: displays.filter(\.isActive).count),
-              let audio = displays.first(where: { $0.id == id })?.audio
+        guard running, wantsMonitorVolume, let output = Self.defaultAudioOutput(),
+              let id = BrightnessSupport.displayForAudioOutput(output, displays: audioCandidates()),
+              let audio = displays.first(where: { $0.id == id && $0.isActive })?.audio
         else { return nil }
         return BrightnessSupport.MonitorSpeakerOutput(
             displayID: id, volume: audio.volume, muted: audio.muted)
@@ -3004,7 +3007,7 @@ final class BrightnessService: ObservableObject {
     private func installAudioOutputObserver() {
         guard audioOutputListener == nil else { return }
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.refreshAudioKeyTarget()
+            self?.defaultAudioOutputChanged()
         }
         var address = Self.defaultOutputAddress
         guard AudioObjectAddPropertyListenerBlock(
@@ -3044,30 +3047,64 @@ final class BrightnessService: ObservableObject {
         AppVolumeMixer.shared.refreshMonitorOutput()
     }
 
-    /// The device the Mac plays through, with its name and how it is wired.
-    /// A device with no readable name keeps an empty one, which the match
-    /// then has to answer by the monitor count alone.
-    private static func defaultOutputDevice() -> (id: AudioObjectID,
-                                                  name: String,
-                                                  transport: UInt32)? {
-        guard let deviceID = AppVolumeMixer.defaultOutputDeviceID() else { return nil }
-        var transport: UInt32 = 0
-        var size = UInt32(MemoryLayout<UInt32>.size)
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyTransportType,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr else {
-            return nil
+    /// Whether monitor speakers need the mixer's output device list. A plain
+    /// defaults read, so the mixer can ask it while it syncs, before or after
+    /// this service has started.
+    static var observesAudioOutputs: Bool {
+        let defaults = UserDefaults.standard
+        return AppFeature.brightness.isAvailable
+            && defaults.bool(forKey: DefaultsKey.brightnessControlEnabled)
+            && defaults.bool(forKey: DefaultsKey.displayVolumeEnabled)
+    }
+
+    /// Called by the mixer after each refresh of its output devices, on main.
+    /// The key target is worked out again only when the default output or
+    /// the list changed, or a default output change is still waiting for it.
+    func audioOutputsRefreshed(changed: Bool) {
+        guard changed || awaitsAudioOutputs else { return }
+        awaitsAudioOutputs = false
+        guard running else { return }
+        refreshAudioKeyTarget()
+    }
+
+    /// The default output changed before the mixer has read the new device
+    /// list. Until it has, nothing is known about the new output, so the keys
+    /// go back to macOS instead of reaching a monitor that may no longer
+    /// carry the sound, and a fresh read is requested.
+    private func defaultAudioOutputChanged() {
+        let cleared = keyThreadLock.withLock { () -> Bool in
+            let had = audioKeyTarget != nil
+            audioKeyTarget = nil
+            return had
         }
-        // CoreAudio hands the name over already retained, so it is taken as
-        // such rather than read into a bridged CFString and leaked.
-        var name: Unmanaged<CFString>?
-        size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-        address.mSelector = kAudioObjectPropertyName
-        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &name) == noErr,
-              let name else { return (deviceID, "", transport) }
-        return (deviceID, name.takeRetainedValue() as String, transport)
+        if cleared { Self.log.log("volume keys now reach display none") }
+        awaitsAudioOutputs = true
+        AppVolumeMixer.shared.refreshApps()
+    }
+
+    /// The output devices as the mixer last read them on its HAL queue, so
+    /// matching a monitor never reads CoreAudio on the main thread.
+    private static func audioOutputs() -> [BrightnessSupport.AudioOutputDevice] {
+        AppVolumeMixer.shared.outputDevices.map {
+            BrightnessSupport.AudioOutputDevice(uid: $0.uid, name: $0.name, transport: $0.transportType,
+                                                hasSettableVolume: $0.hasSettableVolume,
+                                                isDefault: $0.isDefault)
+        }
+    }
+
+    private static func defaultAudioOutput() -> BrightnessSupport.AudioOutputDevice? {
+        audioOutputs().first(where: \.isDefault)
+    }
+
+    /// Every active display with the EDID vendor and model its audio output
+    /// would carry. All of them take part, not only those with speakers, so
+    /// a twin without speakers still makes a match ambiguous.
+    private func audioCandidates() -> [BrightnessSupport.DisplayAudioCandidate] {
+        displays.filter(\.isActive).map {
+            BrightnessSupport.DisplayAudioCandidate(id: $0.id, name: $0.name,
+                                                    vendor: CGDisplayVendorNumber($0.id),
+                                                    model: CGDisplayModelNumber($0.id))
+        }
     }
 
     // MARK: - Speaker probing (work queue)

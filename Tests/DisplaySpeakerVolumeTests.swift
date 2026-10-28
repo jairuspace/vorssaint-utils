@@ -57,26 +57,73 @@ enum DisplaySpeakerVolumeTests {
                      && !Mute.unmutesAfterLevel(muted: nil, volume: 0.5),
                      "an unmute that leaves zero follows the level write, since monitors refuse it at zero")
 
-        let monitors: [(id: UInt32, name: String)] = [(2, "LG HDR 4K"), (3, "DELL U2720Q")]
-        suite.expect(BrightnessSupport.displayForAudioOutput(deviceName: "DELL U2720Q",
-                        candidates: monitors, connectedDisplayCount: 2) == 3
-                     && BrightnessSupport.displayForAudioOutput(deviceName: "dell u2720q",
-                        candidates: monitors, connectedDisplayCount: 2) == 3,
-                     "the sound device is matched to its display by name, ignoring case")
-        suite.expect(BrightnessSupport.displayForAudioOutput(deviceName: "LG HDR 4K Audio",
-                        candidates: monitors, connectedDisplayCount: 2) == 2,
-                     "a device name that extends the display name still matches it")
-        suite.expect(BrightnessSupport.displayForAudioOutput(deviceName: "MacBook Pro Speakers",
-                        candidates: monitors, connectedDisplayCount: 2) == nil
-                     && BrightnessSupport.displayForAudioOutput(deviceName: "",
-                        candidates: monitors, connectedDisplayCount: 2) == nil,
-                     "sound from another device or with no name never routes keys to a display")
-        let lone: [(id: UInt32, name: String)] = [(7, "Studio Display")]
-        suite.expect(BrightnessSupport.displayForAudioOutput(deviceName: "Built-in Output",
-                        candidates: lone, connectedDisplayCount: 1) == 7
-                     && BrightnessSupport.displayForAudioOutput(deviceName: "Built-in Output",
-                        candidates: lone, connectedDisplayCount: 2) == nil,
-                     "a lone candidate answers only while it is the only connected display")
+        let msiUID = "3669D23D-0000-0000-0422-0104B5462778"
+        let samsungUID = "4C2D0C75-0000-0000-0723-0104B5462878_0C80B000"
+        suite.expect(BrightnessSupport.displayAudioIdentity(uid: msiUID).map { [$0.vendor, $0.model] } == [0x3669, 0x3DD2]
+                     && BrightnessSupport.displayAudioIdentity(uid: samsungUID).map { [$0.vendor, $0.model] } == [0x4C2D, 0x750C],
+                     "a display audio UID carries the EDID vendor big-endian and the product little-endian")
+        suite.expect(BrightnessSupport.displayAudioIdentity(uid: "BuiltInSpeakerDevice") == nil
+                     && BrightnessSupport.displayAudioIdentity(uid: "3669D23") == nil
+                     && BrightnessSupport.displayAudioIdentity(uid: "3669D23DX") == nil
+                     && BrightnessSupport.displayAudioIdentity(uid: "0000D23D-0000") == nil
+                     && BrightnessSupport.displayAudioIdentity(uid: "") == nil,
+                     "a UID without the EDID prefix gives no display identity")
+
+        typealias Output = BrightnessSupport.AudioOutputDevice
+        typealias Candidate = BrightnessSupport.DisplayAudioCandidate
+        func output(_ uid: String, _ name: String = "", transport: UInt32 = kAudioDeviceTransportTypeDisplayPort,
+                    settable: Bool = false) -> Output {
+            Output(uid: uid, name: name, transport: transport, hasSettableVolume: settable, isDefault: true)
+        }
+        let desk = [Candidate(id: 1, name: "Built-in Retina Display", vendor: 0x610, model: 0xA050),
+                    Candidate(id: 3, name: "MPG321UX OLED", vendor: 0x3669, model: 0x3DD2),
+                    Candidate(id: 4, name: "Odyssey G5", vendor: 0x4C2D, model: 0x750C)]
+        suite.expect(BrightnessSupport.displayForAudioOutput(output(samsungUID), displays: desk) == 4
+                     && BrightnessSupport.displayForAudioOutput(output(msiUID), displays: desk) == 3,
+                     "the sound device is matched to its display by the EDID identity in its UID")
+        suite.expect(BrightnessSupport.displayForAudioOutput(output(msiUID, transport: kAudioDeviceTransportTypeBuiltIn),
+                                                             displays: desk) == nil
+                     && BrightnessSupport.displayForAudioOutput(output("BuiltInSpeakerDevice", "MacBook Pro Speakers",
+                                                                       transport: kAudioDeviceTransportTypeBuiltIn),
+                                                                displays: desk) == nil
+                     && BrightnessSupport.displayForAudioOutput(output("iPhone-continuity-output", "iPhone",
+                                                                       transport: kAudioDeviceTransportTypeContinuityCaptureWireless),
+                                                                displays: desk) == nil,
+                     "built-in speakers and an iPhone never route keys to a display, whatever their UID")
+        suite.expect(BrightnessSupport.displayForAudioOutput(output(msiUID, settable: true), displays: desk) == nil,
+                     "an output macOS can set the volume of never routes keys to a display")
+        let twins = [Candidate(id: 5, name: "DELL U2720Q", vendor: 0x10AC, model: 0xA0C4),
+                     Candidate(id: 6, name: "DELL U2720Q (2)", vendor: 0x10AC, model: 0xA0C4)]
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("10ACC4A0-0000-0000", "DELL U2720Q (2)"),
+                                                             displays: twins) == 6
+                     && BrightnessSupport.displayForAudioOutput(output("10ACC4A0-0000-0000", "dell u2720q"),
+                                                                displays: twins) == 5,
+                     "two monitors of the same model are told apart by the exact name, ignoring case")
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("10ACC4A0-0000-0000", "DELL U2720Q Audio"),
+                                                             displays: twins) == nil
+                     && BrightnessSupport.displayForAudioOutput(output("10ACC4A0-0000-0000"), displays: twins) == nil,
+                     "two monitors of the same model with no exact name stay with macOS")
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("1E6D0777-0000-0000"), displays: desk) == nil,
+                     "a display UID that matches no connected display routes nowhere")
+        let named = [Candidate(id: 2, name: "LG HDR 4K", vendor: 0, model: 0),
+                     Candidate(id: 3, name: "DELL U2720Q", vendor: 0, model: 0)]
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("hdmi-out", "dell u2720q"), displays: named) == 3,
+                     "without a display UID the device is matched by its exact name, ignoring case")
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("hdmi-out", "LG"), displays: named) == nil
+                     && BrightnessSupport.displayForAudioOutput(output("hdmi-out", "LG HDR 4K Audio"), displays: named) == nil
+                     && BrightnessSupport.displayForAudioOutput(output("hdmi-out", ""), displays: named) == nil,
+                     "a partial or missing name never matches a display")
+        let sameName = [Candidate(id: 2, name: "LG HDR 4K", vendor: 0, model: 0),
+                        Candidate(id: 3, name: "LG HDR 4K", vendor: 0, model: 0)]
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("hdmi-out", "LG HDR 4K"), displays: sameName) == nil,
+                     "a name shared by two displays is ambiguous and stays with macOS")
+        let lone = [Candidate(id: 7, name: "Studio Display", vendor: 0, model: 0)]
+        suite.expect(BrightnessSupport.displayForAudioOutput(output("hdmi-out", "Display Audio"), displays: lone) == 7
+                     && BrightnessSupport.displayForAudioOutput(output("hdmi-out", "Display Audio"), displays: named) == nil,
+                     "without a display UID a lone display answers only while it is the only one active")
+        suite.expect(MixerRoutingSupport.observationNeeds(isAvailable: { _ in false }, monitorSpeakers: true) == (true, false)
+                     && MixerRoutingSupport.observationNeeds(isAvailable: { _ in false }) == (false, false),
+                     "monitor speakers watch the output devices without starting per-app mixer taps")
 
         func keyData(_ code: Int, state: Int, repeatBit: Int = 0) -> Int {
             (code << 16) | (state << 8) | repeatBit
