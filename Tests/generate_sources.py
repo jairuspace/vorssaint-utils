@@ -314,7 +314,8 @@ def main():
           + "extension BrightnessKeyRoutingTests {\nfinal class Service: Fixture {\n"
           + "".join(declaration(brightness, prefix).replace("private func", "func", 1)
                     for prefix in ["    private func handleKeyEvent(",
-                                   "    private func routeFunctionKey("])
+                                   "    private func routeFunctionKey(",
+                                   "    private func display(at location:"])
           + "}\n}\n")
     activator = "Sources/Vorssaint/Services/Switcher/WindowActivator.swift"
     resolver = "Sources/Vorssaint/Services/Switcher/AXWindowResolver.swift"

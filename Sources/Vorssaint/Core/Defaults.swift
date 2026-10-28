@@ -228,6 +228,10 @@ enum DefaultsKey {
     static let brightnessDDCWriteOnlyPaths = "brightnessDDCWriteOnlyPaths"
     static let displayVolumeEnabled = "displayVolumeEnabled" // speakers built into external monitors
     static let displayVolumeKeysEnabled = "displayVolumeKeysEnabled" // volume keys reach those speakers
+    // The volume keys reach the speakers of the monitor under the pointer
+    // while the sound leaves through a monitor. A preference, so it travels
+    // in a backup.
+    static let displayVolumeKeysFollowPointer = "displayVolumeKeysFollowPointer"
     // Per-monitor connection paths whose display answered the audio controls
     // with no speakers behind them. Remembered for the same reason as the
     // write-only paths: two extra reads on a bus paced in tens of
@@ -1378,6 +1382,7 @@ enum Defaults {
         DefaultsKey.brightnessOSDEnabled: false,
         DefaultsKey.displayVolumeEnabled: false,
         DefaultsKey.displayVolumeKeysEnabled: false,
+        DefaultsKey.displayVolumeKeysFollowPointer: false,
         DefaultsKey.brightnessKeyStep: BrightnessSupport.KeyStep.standard.rawValue,
         DefaultsKey.displayBrightnessShortcutsEnabled: false,
         DefaultsKey.displayBrightnessDecreaseShortcut: "shift+command:27",

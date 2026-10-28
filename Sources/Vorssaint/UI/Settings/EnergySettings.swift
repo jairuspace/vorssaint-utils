@@ -20,6 +20,7 @@ struct EnergySettings: View {
     @AppStorage(DefaultsKey.brightnessOSDEnabled) private var brightnessOSDEnabled = false
     @AppStorage(DefaultsKey.displayVolumeEnabled) private var displayVolume = false
     @AppStorage(DefaultsKey.displayVolumeKeysEnabled) private var displayVolumeKeys = false
+    @AppStorage(DefaultsKey.displayVolumeKeysFollowPointer) private var displayVolumeKeysFollowPointer = false
     @AppStorage(DefaultsKey.brightnessKeyStep)
     private var brightnessKeyStep = BrightnessSupport.KeyStep.standard.rawValue
     @AppStorage(DefaultsKey.extraBrightnessEnabled) private var extraBrightnessEnabled = false
@@ -413,6 +414,16 @@ struct EnergySettings: View {
                             if isOn { Permissions.shared.requestAccessibility() }
                             BrightnessService.shared.syncWithPreferences()
                         }
+                }
+                if displayVolumeKeys {
+                    SettingsRow(symbol: "cursorarrow.rays", title: strings.volumeKeysPointerToggle,
+                                caption: strings.volumeKeysPointerCaption) {
+                        Toggle(strings.volumeKeysPointerToggle, isOn: $displayVolumeKeysFollowPointer)
+                            .labelsHidden()
+                            .onChange(of: displayVolumeKeysFollowPointer) { _, _ in
+                                BrightnessService.shared.syncWithPreferences()
+                            }
+                    }
                 }
                 if displayVolumeKeys, !permissions.accessibility {
                     PermissionRow(kind: .accessibility)

@@ -276,6 +276,13 @@ final class BrightnessService: ObservableObject {
     /// or published state. Recomputed on main when the default output changes
     /// and after every scan.
     private var audioKeyTarget: (id: CGDirectDisplayID, supportsMute: Bool)?
+    /// Whether the volume keys may follow the pointer right now: the setting
+    /// is on and the sound leaves through a display output macOS cannot set.
+    /// Under keyThreadLock with the target above.
+    private var audioKeysFollowPointer = false
+    /// Every active display with speakers the keys can reach, and whether they
+    /// take a mute key, sampled on main for the tap. Under keyThreadLock.
+    private var pointerSpeakerDisplays: [CGDirectDisplayID: Bool] = [:]
     private var audioOutputListener: AudioObjectPropertyListenerBlock?
     /// Whether the mixer was last told that monitor speakers need its output
     /// device list, so a preference sync asks it again only on a change.
@@ -1307,6 +1314,16 @@ final class BrightnessService: ObservableObject {
 
     // MARK: - Brightness keys (follow the pointer)
 
+    /// The display under a point in global display coordinates, the same
+    /// lookup for the brightness keys and the volume keys that follow the
+    /// pointer. Cheap enough for an event tap.
+    private func display(at location: CGPoint) -> CGDirectDisplayID? {
+        var display: CGDirectDisplayID = 0
+        var matched: UInt32 = 0
+        guard CGGetDisplaysWithPoint(location, 1, &display, &matched) == .success, matched > 0 else { return nil }
+        return display
+    }
+
     private func syncKeyTap() {
         guard !tapsAreSuspended() else { return }
         let defaults = UserDefaults.standard
@@ -1591,12 +1608,9 @@ final class BrightnessService: ObservableObject {
         let (followsPointer, systemTarget, overlayReplacesNative) = keyThreadLock.withLock {
             (functionKeysFollowPointer, functionKeySystemTarget, overlayReplacesNativeOSD)
         }
-        var pointerDisplay: CGDirectDisplayID = 0
-        var matched: UInt32 = 0
-        let underPointer = followsPointer
-            && CGGetDisplaysWithPoint(event.location, 1, &pointerDisplay, &matched) == .success && matched > 0
         guard let displayID = BrightnessSupport.plainKeyTarget(followsPointer: followsPointer,
-                                                               pointerDisplay: underPointer ? pointerDisplay : nil,
+                                                               pointerDisplay: followsPointer
+                                                                   ? display(at: event.location) : nil,
                                                                systemTarget: systemTarget)
         else { return leaveToSystem() }
 
@@ -3150,16 +3164,46 @@ final class BrightnessService: ObservableObject {
         if writeOnlySpeakerChoices != choices { writeOnlySpeakerChoices = choices }
     }
 
-    /// Tap-side answer for a volume key: whether the press belongs to the
-    /// monitor the sound leaves through. A mute press needs a monitor with a
-    /// mute control; otherwise the event stays with macOS. Reads only the
-    /// sample main keeps, so the tap never waits on published state.
-    func claimsMonitorVolumeKey(_ action: BrightnessSupport.VolumeKeyAction) -> Bool {
-        keyThreadLock.withLock { () -> Bool in
-            guard let target = audioKeyTarget else { return false }
-            if case .toggleMute = action { return target.supportsMute }
-            return true
+    /// Tap-side answer for a volume key: which monitor's speakers take the
+    /// press, or nil to leave it with macOS. The monitor the sound leaves
+    /// through takes it, or the one under the pointer when that setting is on
+    /// (see BrightnessSupport.volumeKeyPressClaim); a mute press needs a
+    /// monitor with a mute control. Reads only the sample main keeps, plus the
+    /// pointer position on a key-down, so the tap never waits on published
+    /// state, CoreAudio or the DDC queue.
+    func monitorVolumeKeyTarget(_ action: BrightnessSupport.VolumeKeyAction, isRepeat: Bool,
+                                held: BrightnessSupport.VolumeKeyHold?) -> BrightnessSupport.VolumeKeyClaim? {
+        let (followsPointer, speakers, output) = keyThreadLock.withLock {
+            (audioKeysFollowPointer, pointerSpeakerDisplays, audioKeyTarget)
         }
+        return BrightnessSupport.volumeKeyPressClaim(
+            action, isRepeat: isRepeat, held: held, followsPointer: followsPointer,
+            pointerDisplay: followsPointer && !isRepeat ? CGEvent(source: nil).flatMap { display(at: $0.location) } : nil,
+            speakerDisplays: speakers,
+            outputTarget: output.map { BrightnessSupport.VolumeKeyTarget(displayID: $0.id, supportsMute: $0.supportsMute) })
+    }
+
+    /// Applies a key the pointer sent to a monitor other than the output's.
+    /// The mixer only knows the output's monitor, so the change goes to this
+    /// service directly, by the same rules the output's monitor follows.
+    /// Returns the speakers as they now are, for the feedback, or nil when
+    /// nothing changed. Main thread only.
+    func applyPointerSpeakerKey(_ action: BrightnessSupport.VolumeKeyAction, fine: Bool,
+                                for id: CGDirectDisplayID) -> BrightnessDisplay.Audio? {
+        guard displays.contains(where: { $0.id == id && $0.isActive }) else { return nil }
+        if !applyWriteOnlySpeakerKey(action, fine: fine, for: id) {
+            guard let audio = displays.first(where: { $0.id == id })?.audio else { return nil }
+            switch action {
+            case let .step(direction):
+                setVolume(BrightnessSupport.steppedLevel(
+                    audio.volume, delta: BrightnessSupport.volumeKeyDelta(direction: direction, fine: fine)),
+                          for: id, raises: direction > 0)
+            case .toggleMute:
+                guard let muted = audio.muted else { return nil }
+                setMuted(!muted, for: id)
+            }
+        }
+        return displays.first(where: { $0.id == id })?.audio
     }
 
     /// A volume key no monitor claimed while the sound leaves through a
@@ -3253,7 +3297,11 @@ final class BrightnessService: ObservableObject {
     }
 
     private func removeAudioOutputObserver() {
-        keyThreadLock.withLock { audioKeyTarget = nil }
+        keyThreadLock.withLock {
+            audioKeyTarget = nil
+            audioKeysFollowPointer = false
+            pointerSpeakerDisplays = [:]
+        }
         guard let listener = audioOutputListener else { return }
         var address = Self.defaultOutputAddress
         AudioObjectRemovePropertyListenerBlock(
@@ -3270,9 +3318,21 @@ final class BrightnessService: ObservableObject {
         if wantsMonitorVolumeKeys, let output = monitorSpeakerOutput() {
             target = (id: output.displayID, supportsMute: output.muted != nil)
         }
+        let followsPointer = BrightnessSupport.pointerVolumeKeysActive(
+            enabled: wantsMonitorVolumeKeys
+                && UserDefaults.standard.bool(forKey: DefaultsKey.displayVolumeKeysFollowPointer),
+            output: running ? Self.defaultAudioOutput() : nil)
+        var speakers: [CGDirectDisplayID: Bool] = [:]
+        if followsPointer {
+            for display in displays where display.isActive {
+                if let audio = display.audio { speakers[display.id] = audio.muted != nil }
+            }
+        }
         let previous = keyThreadLock.withLock { () -> CGDirectDisplayID? in
             let previous = audioKeyTarget?.id
             audioKeyTarget = target
+            audioKeysFollowPointer = followsPointer
+            pointerSpeakerDisplays = speakers
             return previous
         }
         if previous != target?.id {
@@ -3311,6 +3371,8 @@ final class BrightnessService: ObservableObject {
         let cleared = keyThreadLock.withLock { () -> Bool in
             let had = audioKeyTarget != nil
             audioKeyTarget = nil
+            audioKeysFollowPointer = false
+            pointerSpeakerDisplays = [:]
             return had
         }
         if cleared { Self.log.log("volume keys now reach display none") }

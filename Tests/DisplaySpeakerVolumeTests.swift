@@ -244,6 +244,87 @@ enum DisplaySpeakerVolumeTests {
                      && BrightnessSupport.writeOnlySeedDisplays(paths: [:], awaiting: ["msi"]).isEmpty,
                      "turning the opt-in on sends the starting level once the monitor's speaker route exists")
 
+        typealias KeyTarget = BrightnessSupport.VolumeKeyTarget
+        typealias Claim = BrightnessSupport.VolumeKeyClaim
+        let speakers: [UInt32: Bool] = [3: true, 4: false]
+        let msiOutput = KeyTarget(displayID: 3, supportsMute: true)
+        func claim(_ action: BrightnessSupport.VolumeKeyAction = .step(direction: 1), follows: Bool = true,
+                   pointer: UInt32?, output: KeyTarget? = msiOutput) -> Claim? {
+            BrightnessSupport.volumeKeyClaim(action, followsPointer: follows, pointerDisplay: pointer,
+                                             speakerDisplays: speakers, outputTarget: output)
+        }
+        suite.expect(claim(pointer: 4) == Claim(displayID: 4, followsPointer: true)
+                     && claim(pointer: 3) == Claim(displayID: 3, followsPointer: false),
+                     "with the pointer setting on, a volume key reaches the speakers of the monitor under the pointer")
+        suite.expect(claim(pointer: 1) == Claim(displayID: 3, followsPointer: false)
+                     && claim(pointer: 9) == Claim(displayID: 3, followsPointer: false)
+                     && claim(pointer: nil) == Claim(displayID: 3, followsPointer: false),
+                     "the pointer on the built-in or on a monitor without speakers keeps the output's monitor")
+        suite.expect(claim(.toggleMute, pointer: 4) == Claim(displayID: 3, followsPointer: false)
+                     && claim(.toggleMute, pointer: 4, output: KeyTarget(displayID: 3, supportsMute: false)) == nil,
+                     "a mute key under a monitor without mute falls back to the output, and to macOS without one")
+        suite.expect(claim(follows: false, pointer: 4) == Claim(displayID: 3, followsPointer: false)
+                     && claim(.toggleMute, follows: false, pointer: 3) == Claim(displayID: 3, followsPointer: false)
+                     && claim(follows: false, pointer: 4, output: nil) == nil,
+                     "with the pointer setting off, keys follow only the output whatever is under the pointer")
+        suite.expect(claim(pointer: 1, output: nil) == nil && claim(pointer: nil, output: nil) == nil,
+                     "with no speakers under the pointer and none on the output, the key stays with macOS")
+        let airPods = output("AirPods-UID", "AirPods Pro", transport: kAudioDeviceTransportTypeBluetooth, settable: true)
+        let builtInSpeakers = output("BuiltInSpeakerDevice", "MacBook Pro Speakers",
+                                     transport: kAudioDeviceTransportTypeBuiltIn, settable: true)
+        suite.expect(BrightnessSupport.pointerVolumeKeysActive(enabled: true, output: output(msiUID))
+                     && !BrightnessSupport.pointerVolumeKeysActive(enabled: true, output: airPods)
+                     && !BrightnessSupport.pointerVolumeKeysActive(enabled: true, output: builtInSpeakers)
+                     && !BrightnessSupport.pointerVolumeKeysActive(enabled: true, output: output(msiUID, settable: true))
+                     && !BrightnessSupport.pointerVolumeKeysActive(enabled: true, output: nil)
+                     && !BrightnessSupport.pointerVolumeKeysActive(enabled: false, output: output(msiUID)),
+                     "the pointer decides only while the sound leaves through a display output macOS cannot set")
+        suite.expect(claim(follows: BrightnessSupport.pointerVolumeKeysActive(enabled: true, output: airPods),
+                           pointer: 4, output: nil) == nil,
+                     "with AirPods playing, a volume key over an opted-in monitor stays with macOS")
+        typealias Hold = BrightnessSupport.VolumeKeyHold
+        func hold(_ follows: Bool, pointerPath: [UInt32?], output: KeyTarget? = msiOutput) -> [Claim?] {
+            var held: Hold?
+            var claims: [Claim?] = []
+            for (index, pointer) in pointerPath.enumerated() {
+                let claim = BrightnessSupport.volumeKeyPressClaim(
+                    .step(direction: 1), isRepeat: index > 0, held: held, followsPointer: follows,
+                    pointerDisplay: pointer, speakerDisplays: speakers, outputTarget: output)
+                if index == 0 {
+                    held = claim.map { $0.followsPointer ? .pointer($0.displayID) : .output }
+                }
+                claims.append(claim)
+            }
+            return claims
+        }
+        let outputHold = hold(true, pointerPath: [1, 4, 4])
+        suite.expect(outputHold == [Claim(displayID: 3, followsPointer: false), Claim(displayID: 3, followsPointer: false),
+                                    Claim(displayID: 3, followsPointer: false)],
+                     "a held key that went to the output's monitor keeps going there when the pointer moves onto speakers")
+        let pointerHold = hold(true, pointerPath: [4, 3, 1])
+        suite.expect(pointerHold == [Claim(displayID: 4, followsPointer: true), Claim(displayID: 4, followsPointer: true),
+                                     Claim(displayID: 4, followsPointer: true)],
+                     "a held key that went to the monitor under the pointer keeps going there wherever the pointer moves")
+        suite.expect(hold(true, pointerPath: [1, 4], output: nil) == [nil, nil],
+                     "a held key that went to macOS stays with macOS when the pointer moves onto speakers")
+        suite.expect(hold(true, pointerPath: [4]) == [Claim(displayID: 4, followsPointer: true)]
+                     && hold(true, pointerPath: [1]) == [Claim(displayID: 3, followsPointer: false)],
+                     "after the key is released, the next press follows the pointer again")
+        suite.expect(hold(false, pointerPath: [4, 4]) == [Claim(displayID: 3, followsPointer: false),
+                                                          Claim(displayID: 3, followsPointer: false)]
+                     && hold(false, pointerPath: [1, 1], output: nil) == [nil, nil],
+                     "with the pointer setting off, held keys follow only the output as before")
+        suite.expect(Defaults.registeredDefaults[DefaultsKey.displayVolumeKeysFollowPointer] as? Bool == false
+                     && SettingsBackupSupport.exportKeys().contains(DefaultsKey.displayVolumeKeysFollowPointer),
+                     "volume keys following the pointer is off until enabled and travels in a settings backup")
+        suite.expect(AppLanguage.allCases.allSatisfy {
+                         let strings = FeatureStrings.brightness($0)
+                         return !strings.volumeKeysPointerToggle.isEmpty && !strings.volumeKeysPointerCaption.isEmpty
+                             && ($0 == .enUS
+                                 || strings.volumeKeysPointerToggle != FeatureStrings.brightness(.enUS).volumeKeysPointerToggle)
+                     },
+                     "the volume keys pointer setting is translated in every language")
+
         func keyData(_ code: Int, state: Int, repeatBit: Int = 0) -> Int {
             (code << 16) | (state << 8) | repeatBit
         }

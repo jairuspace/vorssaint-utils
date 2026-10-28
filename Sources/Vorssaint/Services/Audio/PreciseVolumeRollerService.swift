@@ -19,6 +19,9 @@ final class PreciseVolumeRollerService: ObservableObject {
     /// Monitor volume presses this tap claimed and has not yet seen released,
     /// so their key-ups are consumed too. Main thread only: the tap runs there.
     private var monitorVolumeKeysHeld = Set<BrightnessSupport.VolumeKeyAction>()
+    /// Held presses the pointer sent to a monitor other than the output's,
+    /// so their repeats stay with that monitor. Main thread only.
+    private var pointerVolumeKeysHeld: [BrightnessSupport.VolumeKeyAction: CGDirectDisplayID] = [:]
     /// Island steps bypass the system, so its volume click plays on release here.
     /// Waits for both the release and the last step's adjustment, so a failed
     /// step forwarded to macOS never plays a second click.
@@ -68,6 +71,7 @@ final class PreciseVolumeRollerService: ObservableObject {
         feedback = nil
         keyOwnership = PreciseVolumeKeyOwnership()
         monitorVolumeKeysHeld = []
+        pointerVolumeKeysHeld = [:]
     }
 
     private func start() {
@@ -148,12 +152,15 @@ final class PreciseVolumeRollerService: ObservableObject {
     }
 
     /// Routes a volume press to the monitor the sound plays through, when macOS
-    /// cannot set that output's volume. Every other press keeps its path. The
+    /// cannot set that output's volume, or to the monitor under the pointer
+    /// when that setting is on. Every other press keeps its path. The owner is
+    /// chosen at key-down and kept for the repeats and the release. The
     /// press is claimed here and applied on main, so the tap waits on nothing.
     private func routeMonitorVolume(_ nsEvent: NSEvent, flags: CGEventFlags) -> Bool {
         guard let press = BrightnessSupport.volumeKeyEvent(
             subtype: Int(nsEvent.subtype.rawValue), data1: nsEvent.data1) else { return false }
         if !press.isKeyDown {
+            pointerVolumeKeysHeld[press.action] = nil
             return monitorVolumeKeysHeld.remove(press.action) != nil
         }
         guard let fine = BrightnessSupport.volumeKeyFineness(
@@ -163,13 +170,18 @@ final class PreciseVolumeRollerService: ObservableObject {
         if press.isRepeat, case .toggleMute = press.action {
             return monitorVolumeKeysHeld.contains(press.action)
         }
-        guard BrightnessService.shared.claimsMonitorVolumeKey(press.action) else {
+        let held: BrightnessSupport.VolumeKeyHold? = pointerVolumeKeysHeld[press.action].map { .pointer($0) }
+            ?? (monitorVolumeKeysHeld.contains(press.action) ? .output : nil)
+        guard let claim = BrightnessService.shared.monitorVolumeKeyTarget(
+            press.action, isRepeat: press.isRepeat, held: held) else {
             if !press.isRepeat {
                 DispatchQueue.main.async { BrightnessService.shared.rescanForUnclaimedVolumeKey() }
             }
             return false
         }
         monitorVolumeKeysHeld.insert(press.action)
+        pointerVolumeKeysHeld[press.action] = claim.followsPointer ? claim.displayID : nil
+        let pointerDisplay = claim.followsPointer ? claim.displayID : nil
         let action = press.action
         // The precise volume setting applies to the monitor as it does to any
         // other output: wheel bursts are thinned by the same gate and each
@@ -180,9 +192,26 @@ final class PreciseVolumeRollerService: ObservableObject {
             return true
         }
         DispatchQueue.main.async {
-            Self.applyMonitorVolumeKey(action, fine: fine || precise)
+            if let pointerDisplay {
+                Self.applyPointerVolumeKey(action, fine: fine || precise, displayID: pointerDisplay)
+            } else {
+                Self.applyMonitorVolumeKey(action, fine: fine || precise)
+            }
         }
         return true
+    }
+
+    /// Applies a press the pointer sent to a monitor other than the output's
+    /// and shows that monitor's level: the island when it takes the notice,
+    /// otherwise the overlay on that monitor.
+    private static func applyPointerVolumeKey(_ action: BrightnessSupport.VolumeKeyAction, fine: Bool,
+                                              displayID: CGDirectDisplayID) {
+        guard let audio = BrightnessService.shared.applyPointerSpeakerKey(action, fine: fine, for: displayID) else {
+            return
+        }
+        if NotchService.shared.showVolume(audio.volume, muted: audio.muted) { return }
+        BrightnessOSD.show(displayID: displayID, level: audio.volume,
+                           kind: audio.muted == true ? .mutedVolume : .volume)
     }
 
     /// Applies a press that routeMonitorVolume claimed. Main thread only, where

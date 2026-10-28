@@ -1022,6 +1022,78 @@ enum BrightnessSupport {
         return WriteOnlySpeakerLevel(stored: storedLevels?[pathKey]) ?? .firstUse()
     }
 
+    /// The monitor the volume keys reach through the sound output, as the tap
+    /// sees it, and whether its speakers take a mute key.
+    struct VolumeKeyTarget: Equatable {
+        let displayID: UInt32
+        let supportsMute: Bool
+    }
+
+    /// Who takes a volume key. `followsPointer` is set when the pointer chose
+    /// a monitor other than the output's, which then gets the change and the
+    /// feedback directly; otherwise the press takes the output's path.
+    struct VolumeKeyClaim: Equatable {
+        let displayID: UInt32
+        let followsPointer: Bool
+    }
+
+    /// Who takes a fresh volume key press. With the pointer setting on, the
+    /// monitor under the pointer wins if it has speakers (and, for the mute
+    /// key, a mute); otherwise the output's monitor does. Nil leaves the press
+    /// with macOS. With the setting off the pointer is never consulted.
+    static func volumeKeyClaim(_ action: VolumeKeyAction, followsPointer: Bool, pointerDisplay: UInt32?,
+                               speakerDisplays: [UInt32: Bool], outputTarget: VolumeKeyTarget?) -> VolumeKeyClaim? {
+        let isMute = action == .toggleMute
+        if followsPointer, let pointerDisplay, let supportsMute = speakerDisplays[pointerDisplay],
+           !isMute || supportsMute {
+            return VolumeKeyClaim(displayID: pointerDisplay,
+                                  followsPointer: pointerDisplay != outputTarget?.displayID)
+        }
+        guard let outputTarget, !isMute || outputTarget.supportsMute else { return nil }
+        return VolumeKeyClaim(displayID: outputTarget.displayID, followsPointer: false)
+    }
+
+    /// Whether the pointer may choose the monitor. Only while the sound leaves
+    /// through a display output macOS cannot set, as MonitorControl does: with
+    /// headphones, AirPods or built-in speakers the keys stay with macOS
+    /// whatever is under the pointer.
+    static func pointerVolumeKeysActive(enabled: Bool, output: AudioOutputDevice?) -> Bool {
+        guard enabled, let output else { return false }
+        return displayOwnsOutputVolume(transport: output.transport, outputHasSettableVolume: output.hasSettableVolume)
+    }
+
+    /// Who took a held key at key-down: the monitor under the pointer, or the
+    /// output's monitor. Nil when macOS took it.
+    enum VolumeKeyHold: Equatable {
+        case pointer(UInt32)
+        case output
+    }
+
+    /// Who takes a key press, holding the choice made at key-down for its
+    /// repeats: moving the pointer while a key is held never moves the change
+    /// to another monitor. With the pointer setting off, every press is
+    /// decided by the output alone, as before the setting existed.
+    static func volumeKeyPressClaim(_ action: VolumeKeyAction, isRepeat: Bool, held: VolumeKeyHold?,
+                                    followsPointer: Bool, pointerDisplay: UInt32?,
+                                    speakerDisplays: [UInt32: Bool],
+                                    outputTarget: VolumeKeyTarget?) -> VolumeKeyClaim? {
+        if isRepeat {
+            switch held {
+            case let .pointer(id)?:
+                return VolumeKeyClaim(displayID: id, followsPointer: true)
+            case .output? where followsPointer:
+                return volumeKeyClaim(action, followsPointer: false, pointerDisplay: nil,
+                                      speakerDisplays: [:], outputTarget: outputTarget)
+            case nil where followsPointer:
+                return nil
+            default:
+                break
+            }
+        }
+        return volumeKeyClaim(action, followsPointer: followsPointer, pointerDisplay: pointerDisplay,
+                              speakerDisplays: speakerDisplays, outputTarget: outputTarget)
+    }
+
     /// The displays whose starting level is due: their write-only speakers
     /// exist now and their path was just opted in.
     static func writeOnlySeedDisplays(paths: [UInt32: String], awaiting: Set<String>) -> [UInt32] {
