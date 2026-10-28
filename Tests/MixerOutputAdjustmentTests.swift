@@ -1133,7 +1133,7 @@ enum MixerOutputAdjustmentContract {
                      "a slider set is handed over as a raise, as a slider move lifts mute elsewhere")
         mixer = monitorMixer(muted: nil)
         var noMuteDone: Bool?
-        mixer.requestOutputMuteToggle { noMuteDone = $0 }
+        mixer.requestOutputMuteToggle { noMuteDone = $0.handled }
         suite.expect(noMuteDone == false && speakers.writes.isEmpty,
                      "a monitor without an MCCS mute control refuses the mute toggle")
         mixer = monitorMixer(muted: false)

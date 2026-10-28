@@ -186,6 +186,11 @@ enum SettingsBackupSupport {
         DefaultsKey.brightnessDDCWriteOnlyPaths,
         // Speaker probe verdicts: the same stated reason as the write-only paths.
         DefaultsKey.displayAudioSilentPaths,
+        // Write-only speaker choices and the levels sent to them describe one
+        // monitor on one port; another Mac would step from a level its
+        // monitor never had.
+        DefaultsKey.displayAudioBlindPaths,
+        DefaultsKey.displayAudioLevels,
         // Restoring it would skip the one-time recheck of the cache above on
         // a Mac that still holds its own stale verdicts.
         DefaultsKey.brightnessDDCWriteOnlyPathsRechecked,

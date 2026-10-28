@@ -17,6 +17,11 @@ struct MixerOutputDevice: Identifiable, Equatable {
     let canBeDefaultOutput: Bool
     let canBeDefaultSystemOutput: Bool
     let priorityTier: MixerRoutingSupport.PriorityTier
+    /// How the device is wired, as CoreAudio reports it.
+    let transportType: UInt32
+    /// Whether macOS can set the device's output volume. A monitor's speakers
+    /// usually cannot be, which is what hands their keys to the monitor.
+    let hasSettableVolume: Bool
     fileprivate let audioObjectID: AudioObjectID
 }
 
@@ -233,7 +238,9 @@ final class AppVolumeMixer: ObservableObject {
     /// System device observation is shared with Audio device priority and the
     /// output switcher. The per-app portion still follows only Volume mixer.
     func syncWithPreferences() {
-        let needs = MixerRoutingSupport.observationNeeds(isAvailable: { $0.isAvailable })
+        let needs = MixerRoutingSupport.observationNeeds(
+            isAvailable: { $0.isAvailable },
+            monitorSpeakers: BrightnessService.observesAudioOutputs)
         guard needs.devices else {
             stop()
             return
@@ -1712,6 +1719,8 @@ final class AppVolumeMixer: ObservableObject {
         // Assigning a @Published property signals SwiftUI even when the value is
         // identical, and refreshes run on every CoreAudio notification — publish
         // only real changes or a chatty HAL re-renders the panel continuously.
+        let audioOutputsChanged = currentOutputDeviceUID != snapshot.defaultUID
+            || snapshot.outputDevices != outputDevices
         if currentOutputDeviceUID != snapshot.defaultUID {
             currentOutputDeviceUID = snapshot.defaultUID
         }
@@ -1721,6 +1730,9 @@ final class AppVolumeMixer: ObservableObject {
         if snapshot.outputDevices != outputDevices {
             outputDevices = snapshot.outputDevices
         }
+        // Monitor speakers follow the default output from this list rather
+        // than reading CoreAudio on the main thread themselves.
+        BrightnessService.shared.audioOutputsRefreshed(changed: audioOutputsChanged)
         subscribeToOutputControls(of: snapshot.defaultDeviceID)
         applyOutputControls(volume: snapshot.systemOutputVolume, muted: snapshot.systemOutputMuted)
 
@@ -2588,6 +2600,8 @@ final class AppVolumeMixer: ObservableObject {
                                              canBeDefaultSystemOutput: canBeDefaultSystemOutput,
                                              priorityTier: MixerRoutingSupport.PriorityTier(
                                                 transportType: transportType),
+                                             transportType: transportType,
+                                             hasSettableVolume: hasSettableOutputVolume(for: deviceID),
                                              audioObjectID: deviceID))
         }
 
@@ -2610,6 +2624,8 @@ final class AppVolumeMixer: ObservableObject {
                                              canBeDefaultOutput: false,
                                              canBeDefaultSystemOutput: false,
                                              priorityTier: .hardware,
+                                             transportType: 0,
+                                             hasSettableVolume: false,
                                              audioObjectID: 0))
         }
 
