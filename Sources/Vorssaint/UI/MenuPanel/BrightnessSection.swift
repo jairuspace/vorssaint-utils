@@ -217,7 +217,8 @@ struct BrightnessSection: View {
             Text("\(Int((audio.volume * 100).rounded()))%")
                 .font(.system(size: 10, weight: .semibold).monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(width: 30, alignment: .trailing)
+                .fixedSize()
+                .frame(minWidth: 30, alignment: .trailing)
         }
     }
 }
