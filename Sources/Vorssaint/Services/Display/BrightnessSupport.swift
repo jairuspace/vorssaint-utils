@@ -798,6 +798,13 @@ enum BrightnessSupport {
         }
     }
 
+    /// Whether a mute reply of zero may still be a working control, read as
+    /// unmuted until the first mute proves it: some monitors (a Samsung
+    /// S34C65xT) report 0 for unmuted, 1 for muted, and take the MCCS writes.
+    static func unconfirmedMuteReply(current: UInt16, maximum: UInt16) -> Bool {
+        current == 0 && maximum >= audioUnmutedValue
+    }
+
     static func muteDeviceValue(_ muted: Bool) -> UInt16 {
         muted ? audioMutedValue : audioUnmutedValue
     }

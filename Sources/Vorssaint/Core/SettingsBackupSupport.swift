@@ -214,6 +214,7 @@ enum SettingsBackupSupport {
         DefaultsKey.brightnessDDCWriteOnlyPaths,
         // Speaker probe verdicts: the same stated reason as the write-only paths.
         DefaultsKey.displayAudioSilentPaths,
+        DefaultsKey.displayMuteSilentPaths,
         // Restoring it would skip the one-time recheck of the cache above on
         // a Mac that still holds its own stale verdicts.
         DefaultsKey.brightnessDDCWriteOnlyPathsRechecked,

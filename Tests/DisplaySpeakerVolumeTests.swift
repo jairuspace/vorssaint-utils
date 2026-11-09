@@ -21,6 +21,10 @@ enum DisplaySpeakerVolumeTests {
                      && BrightnessSupport.muteReply(current: 3, maximum: 100) == nil
                      && BrightnessSupport.muteReply(current: 1, maximum: 1) == nil,
                      "any other mute value is not a mute control")
+        suite.expect(BrightnessSupport.unconfirmedMuteReply(current: 0, maximum: 255)
+                     && !BrightnessSupport.unconfirmedMuteReply(current: 0, maximum: 1)
+                     && !BrightnessSupport.unconfirmedMuteReply(current: 3, maximum: 100),
+                     "a mute reading 0 is tried once, read back, before it counts")
         suite.expect(BrightnessSupport.muteDeviceValue(true) == BrightnessSupport.audioMutedValue
                      && BrightnessSupport.muteDeviceValue(false) == BrightnessSupport.audioUnmutedValue,
                      "mute writes use the MCCS values")

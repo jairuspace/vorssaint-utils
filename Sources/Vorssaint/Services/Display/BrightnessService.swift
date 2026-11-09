@@ -136,6 +136,9 @@ final class BrightnessService: ObservableObject {
     private struct AudioRoute {
         var maximum: UInt16
         var supportsMute: Bool
+        /// Set when the mute answered 0: the first mute is read back, and a
+        /// monitor that does not then read muted is remembered as having none.
+        var unconfirmedMutePath: String?
     }
 
     private struct Route {
@@ -2549,6 +2552,14 @@ final class BrightnessService: ObservableObject {
                                       code: BrightnessSupport.audioMuteCode,
                                       value: BrightnessSupport.muteDeviceValue(muted)))
             Self.log.log("wrote display \(id) mute \(muted) ok \(written)")
+            guard muted, written, let path = audio.unconfirmedMutePath else { return }
+            guard case .replied(BrightnessSupport.audioMutedValue, _) =
+                    ddcProbe(BrightnessSupport.audioMuteCode, for: id, service: service) else {
+                Self.log.log("display \(id) mute did not read back; no mute control")
+                rememberPath(path, key: DefaultsKey.displayMuteSilentPaths, remembered: true)
+                DispatchQueue.main.async { [weak self] in self?.refresh(force: true) }
+                return
+            }
         }
         let unmutesLast = BrightnessSupport.unmutesAfterLevel(muted: muted, volume: pending.volume)
         if let muted, !unmutesLast { writeMute(muted) }
@@ -3114,12 +3125,21 @@ final class BrightnessService: ObservableObject {
         }
         rememberPath(pathKey, key: DefaultsKey.displayAudioSilentPaths, remembered: false)
         var muted: Bool?
+        var unconfirmedMutePath: String?
         if case let .replied(muteCurrent, muteMaximum) = ddcProbe(BrightnessSupport.audioMuteCode,
                                                                   for: id, service: service) {
             muted = BrightnessSupport.muteReply(current: muteCurrent, maximum: muteMaximum)
+            if muted == nil,
+               BrightnessSupport.unconfirmedMuteReply(current: muteCurrent, maximum: muteMaximum),
+               let pathKey, !rememberedPaths(DefaultsKey.displayMuteSilentPaths).contains(pathKey) {
+                muted = false
+                unconfirmedMutePath = pathKey
+            }
         }
         Self.log.log("ddc audio probe display \(id): volume \(volume) mute \(String(describing: muted), privacy: .public)")
-        return (AudioRoute(maximum: maximum, supportsMute: muted != nil),
+        return (AudioRoute(maximum: maximum, supportsMute: muted != nil,
+                           unconfirmedMutePath: unconfirmedMutePath),
+
                 BrightnessDisplay.Audio(volume: volume, muted: muted))
     }
 
