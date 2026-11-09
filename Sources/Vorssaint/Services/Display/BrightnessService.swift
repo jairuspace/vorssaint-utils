@@ -2044,6 +2044,9 @@ final class BrightnessService: ObservableObject {
         var built: [BrightnessDisplay] = []
         var newRoutes: [CGDirectDisplayID: Route] = [:]
         var ddcCandidates: [(index: Int, identity: BrightnessSupport.DisplayIdentity)] = []
+        // Externals the system pipeline dims (some USB-C monitors) can still
+        // carry their speakers over DDC.
+        var audioOnlyIndices = Set<Int>()
         var virtualIDs = Set<CGDirectDisplayID>()
 
         for id in onlineIDs {
@@ -2097,6 +2100,10 @@ final class BrightnessService: ObservableObject {
                                                method: .system, isActive: true,
                                                brightness: trusted, readable: !asleep))
                 newRoutes[id] = Route(method: .system, service: nil, maximum: 100)
+                if !isBuiltIn {
+                    audioOnlyIndices.insert(built.count - 1)
+                    ddcCandidates.append((built.count - 1, Self.displayIdentity(id, info: info)))
+                }
                 if !asleep {
                     stateLock.lock()
                     levelKnownAt[id] = Date()
@@ -2172,7 +2179,7 @@ final class BrightnessService: ObservableObject {
         // Sampled once for the whole pass, so every channel that answers
         // brightness is asked about its speakers, or none is.
         let probesAudio = wantsMonitorVolume
-        var softwareIndices = Set(ddcCandidates.map(\.index))
+        var softwareIndices = Set(ddcCandidates.map(\.index)).subtracting(audioOnlyIndices)
         var forcedSoftwareIDs = Set<CGDirectDisplayID>()
         var extendedDimmingIDs = Set<CGDirectDisplayID>()
         var softwarePathKeys: [CGDirectDisplayID: String] = [:]
@@ -2205,6 +2212,16 @@ final class BrightnessService: ObservableObject {
                 let pathKey = BrightnessSupport.ddcPathKey(
                     displayFingerprint: Self.displayFingerprint(id),
                     ioDisplayLocation: ioDisplayLocation)
+                if audioOnlyIndices.contains(candidate.index) {
+                    guard probesAudio,
+                          let audio = probeAudio(for: id, service: matched.service,
+                                                 pathKey: pathKey) else { continue }
+
+                    built[candidate.index].audio = audio.state
+                    newRoutes[id]?.service = matched.service
+                    newRoutes[id]?.audio = audio.route
+                    continue
+                }
                 if let pathKey, forcedSoftwarePaths().contains(pathKey) {
                     // Chosen by hand: leave the display in `softwareIndices`
                     // so it takes the gamma route below, and do not spend a
@@ -2524,8 +2541,7 @@ final class BrightnessService: ObservableObject {
     private func writePendingAudio(_ pending: PendingAudio,
                                    to id: CGDirectDisplayID,
                                    route: Route?) {
-        guard let route, route.method == .ddc,
-              let service = route.service, let audio = route.audio else { return }
+        guard let route, let service = route.service, let audio = route.audio else { return }
         let muted = audio.supportsMute ? pending.muted : nil
         func writeMute(_ muted: Bool) {
             let written = ddcSend(to: id, service: service,
