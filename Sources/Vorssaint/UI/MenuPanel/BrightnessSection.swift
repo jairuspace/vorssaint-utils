@@ -207,9 +207,11 @@ struct BrightnessSection: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 16)
             }
+            // Like the system's own volume slider, letting go clicks at the new level.
             Slider(value: Binding(get: { audio.volume },
                                   set: { service.setVolume($0, for: display.id) }),
-                   in: 0...1)
+                   in: 0...1,
+                   onEditingChanged: { if !$0 { PreciseVolumeRollerService.playVolumeFeedback() } })
                 .controlSize(.small)
                 .accessibilityLabel("\(display.name) \(strings.volumeLabel)")
             Text("\(Int((audio.volume * 100).rounded()))%")

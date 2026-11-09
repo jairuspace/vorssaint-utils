@@ -153,8 +153,14 @@ final class PreciseVolumeRollerService: ObservableObject {
     private func routeMonitorVolume(_ nsEvent: NSEvent, flags: CGEventFlags) -> Bool {
         guard let press = BrightnessSupport.volumeKeyEvent(
             subtype: Int(nsEvent.subtype.rawValue), data1: nsEvent.data1) else { return false }
+        let code = Int32((nsEvent.data1 >> 16) & 0xffff)
         if !press.isKeyDown {
-            return monitorVolumeKeysHeld.remove(press.action) != nil
+            guard monitorVolumeKeysHeld.remove(press.action) != nil else { return false }
+            if feedback?.key == code {
+                feedback?.released = true
+                playFeedbackIfReady()
+            }
+            return true
         }
         guard let fine = BrightnessSupport.volumeKeyFineness(
             option: flags.contains(.maskAlternate),
@@ -179,28 +185,53 @@ final class PreciseVolumeRollerService: ObservableObject {
            !gate.accepts(direction > 0 ? .up : .down, at: ProcessInfo.processInfo.systemUptime) {
             return true
         }
-        DispatchQueue.main.async {
-            Self.applyMonitorVolumeKey(action, fine: fine || precise)
+        // The monitor's speakers click like the system's own outputs: on
+        // release, once the step landed, under the same feedback setting.
+        feedbackStep &+= 1
+        let step = feedbackStep
+        feedback = NotchVolumeKeyGate.playsFeedback(
+            setting: UserDefaults.standard.bool(forKey: "com.apple.sound.beep.feedback"),
+            option: flags.contains(.maskAlternate), shift: flags.contains(.maskShift))
+            ? (code, step, false, false) : nil
+        DispatchQueue.main.async { [weak self] in
+            self?.applyMonitorVolumeKey(action, fine: fine || precise, step: step)
         }
         return true
     }
 
     /// Applies a press that routeMonitorVolume claimed. Main thread only, where
     /// the mixer's monitor output and its request path live.
-    private static func applyMonitorVolumeKey(_ action: BrightnessSupport.VolumeKeyAction, fine: Bool) {
+    private func applyMonitorVolumeKey(_ action: BrightnessSupport.VolumeKeyAction,
+                                       fine: Bool, step: Int) {
         let mixer = AppVolumeMixer.shared
-        guard mixer.outputIsMonitorSpeakers else { return }
+        guard mixer.outputIsMonitorSpeakers else {
+            if feedback?.step == step { feedback = nil }
+            return
+        }
+        // Like macOS, the mute key clicks only when it unmutes.
+        let landed: (AppVolumeMixer.OutputKeyResult) -> Void = { [weak self] result in
+            if result == .applied { Self.showMonitorFeedback() }
+            guard let self, self.feedback?.step == step else { return }
+            let clicks: Bool
+            switch action {
+            case .step: clicks = true
+            case .toggleMute: clicks = mixer.monitorOutput?.muted == false
+            }
+
+            if result == .applied, clicks {
+                self.feedback?.applied = true
+            } else {
+                self.feedback = nil
+            }
+            self.playFeedbackIfReady()
+        }
         switch action {
         case let .step(direction):
             mixer.requestOutputStep(level: {
                 BrightnessSupport.steppedLevel($0, delta: BrightnessSupport.volumeKeyDelta(direction: direction, fine: fine))
-            }, raises: direction > 0, completion: { result in
-                if result == .applied { Self.showMonitorFeedback() }
-            })
+            }, raises: direction > 0, completion: landed)
         case .toggleMute:
-            mixer.requestOutputMuteToggle(completion: { result in
-                if result == .applied { Self.showMonitorFeedback() }
-            })
+            mixer.requestOutputMuteToggle(completion: landed)
         }
     }
 
@@ -288,6 +319,15 @@ final class PreciseVolumeRollerService: ObservableObject {
             } else { completion(.fallback) }
         }
         return true
+    }
+
+    /// The click macOS plays after a volume change, under its "Play feedback
+    /// when volume is changed" setting.
+
+    static func playVolumeFeedback() {
+        guard UserDefaults.standard.bool(forKey: "com.apple.sound.beep.feedback") else { return }
+        volumeFeedback?.stop()
+        volumeFeedback?.play()
     }
 
     private func playFeedbackIfReady() {
